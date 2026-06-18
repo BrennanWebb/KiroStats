@@ -67,8 +67,12 @@ def _get_db_path() -> str:
         raise OSError(f"Unsupported platform: {system}")
 
 
-def _read_current_usage() -> float:
-    """Read the current credit usage value from Kiro's SQLite cache."""
+def _read_current_usage() -> tuple[float, str]:
+    """Read the current credit usage value and sync timestamp from Kiro's SQLite cache.
+    
+    Returns:
+        Tuple of (current_usage_credits, last_synced_iso_timestamp)
+    """
     db_path = _get_db_path()
 
     if not os.path.exists(db_path):
@@ -99,9 +103,12 @@ def _read_current_usage() -> float:
 
     breakdowns = usage_state.get("usageBreakdowns", [])
     if not breakdowns:
-        return 0.0
+        return 0.0, ""
 
-    return breakdowns[0].get("currentUsage", 0.0)
+    ts = usage_state.get("timestamp", 0)
+    last_synced = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
+
+    return breakdowns[0].get("currentUsage", 0.0), last_synced
 
 
 def _read_usage_state() -> dict:
@@ -169,13 +176,14 @@ def start_session() -> dict:
     global _active_session_id
 
     session_id = str(uuid.uuid4())[:8]
-    start_credits = _read_current_usage()
+    start_credits, start_synced = _read_current_usage()
     now = time.time()
 
     _sessions[session_id] = {
         "session_id": session_id,
         "start_time": now,
         "start_credits": start_credits,
+        "start_synced": start_synced,
         "interactions": [],  # list of {start, end} for thinking-time tracking
     }
     _active_session_id = session_id
@@ -186,6 +194,7 @@ def start_session() -> dict:
         "session_id": session_id,
         "started_at": start_dt,
         "starting_credits_used": round(start_credits, 2),
+        "cache_synced_at": start_synced,
         "message": "Session tracking started. Call get_session_stats at any time for metrics.",
     }
 
@@ -249,8 +258,19 @@ def get_session_stats(session_id: Optional[str] = None) -> dict:
     now = time.time()
 
     # Credit delta
-    current_credits = _read_current_usage()
+    current_credits, last_synced = _read_current_usage()
     session_credits = current_credits - session["start_credits"]
+
+    # Detect if the cache synced AFTER the session started (meaningful delta)
+    # Parse last_synced to compare with session start
+    sync_is_fresh = False
+    if last_synced:
+        try:
+            sync_dt = datetime.fromisoformat(last_synced)
+            session_start_dt = datetime.fromtimestamp(session["start_time"], tz=timezone.utc)
+            sync_is_fresh = sync_dt > session_start_dt
+        except (ValueError, TypeError):
+            pass
 
     # Thinking time (sum of all logged interactions)
     total_thinking = sum(i["thinking_seconds"] for i in session["interactions"])
@@ -260,17 +280,26 @@ def get_session_stats(session_id: Optional[str] = None) -> dict:
 
     start_dt = datetime.fromtimestamp(session["start_time"], tz=timezone.utc).isoformat()
 
-    return {
+    result = {
         "session_id": sid,
         "started_at": start_dt,
-        "session_credits_used": round(session_credits, 2),
+        "session_credits_used": round(max(0, session_credits), 2),
         "total_thinking_time_seconds": round(total_thinking, 1),
         "total_thinking_time_display": _format_duration(total_thinking),
         "wall_clock_seconds": round(wall_clock, 1),
         "wall_clock_display": _format_duration(wall_clock),
         "interaction_count": len(session["interactions"]),
         "current_plan_credits_used": round(current_credits, 2),
+        "last_synced": last_synced,
     }
+
+    if not sync_is_fresh:
+        result["note"] = (
+            "Credit delta may be inaccurate — the usage cache has not synced "
+            "since this session started. It typically refreshes every few minutes."
+        )
+
+    return result
 
 
 @mcp.tool()
