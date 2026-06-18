@@ -1,79 +1,75 @@
-# kiro-usage-mcp
+# KiroStats
 
-A local MCP server that exposes your Kiro IDE credit usage to AI agents.
+Real-time credit usage and session tracking for Kiro IDE — as an MCP server.
 
-No auth, no network calls — reads directly from Kiro's local SQLite cache on your machine.
+No auth. No network. No cloud dependency. Reads directly from Kiro's local state on your machine.
 
-## What it does
+## What You Get
 
-Provides a single tool `get_usage` that returns:
-- Plan credit limit
-- Credits used this billing cycle
-- Remaining credits
-- Percent used
-- Overage details (if over limit): charges, rate, cap
-- Days until reset
+Once installed, Kiro automatically tracks every chat session:
 
-## Install
+- **Session credits** — how many credits this conversation has consumed
+- **Thinking time** — cumulative seconds the agent spent processing
+- **Wall-clock time** — how long the chat has been open
+- **Plan usage** — monthly limit, used, remaining, overage charges
+- **Jira-ready summaries** — markdown output you can paste or auto-attach to tickets
 
-### Option A: uvx (recommended, no install needed)
+Ask at any point:
+> "What's my credit usage this session?"
+> "How long has Kiro been thinking?"
+> "How long has this chat been open?"
+> "Give me a session summary for Jira."
 
-Add to your `.kiro/settings/mcp.json`:
+## Install (One Command)
 
-```json
-{
-  "mcpServers": {
-    "kiro-usage": {
-      "command": "uvx",
-      "args": ["kiro-usage-mcp"]
-    }
-  }
-}
-```
-
-### Option B: pip install + run directly
-
-```bash
-pip install kiro-usage-mcp
-```
-
-Then in `.kiro/settings/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "kiro-usage": {
-      "command": "kiro-usage-mcp"
-    }
-  }
-}
-```
-
-### Option C: Run from source (development)
-
-```bash
+```powershell
 git clone https://github.com/BrennanWebb/KiroStats.git
 cd KiroStats
+.\install.ps1
+```
+
+The installer:
+1. Pip-installs the MCP server package
+2. Registers it in your user-level `~/.kiro/settings/mcp.json`
+3. Creates a hook that auto-starts session tracking on every chat
+4. Adds a steering file so the agent knows how to use the tools
+
+**Restart Kiro after install.** Session tracking begins on your next chat.
+
+## Manual Install (if you prefer)
+
+```bash
 pip install -e .
 ```
 
-Then in `.kiro/settings/mcp.json`:
-
+Add to `~/.kiro/settings/mcp.json`:
 ```json
 {
   "mcpServers": {
     "kiro-usage": {
-      "command": "python",
-      "args": ["-m", "kiro_usage_mcp.server"]
+      "command": "kiro-usage-mcp",
+      "autoApprove": ["start_session", "log_interaction", "get_session_stats", "get_plan_usage", "get_session_summary"]
     }
   }
 }
 ```
 
+Then copy the hook and steering files from the install script, or create them manually.
+
+## Tools
+
+| Tool | Description |
+|------|-------------|
+| `start_session` | Snapshots current credits and starts the clock. Called automatically by hook. |
+| `log_interaction` | Records thinking time for an agent turn. |
+| `get_session_stats` | Returns session credits, thinking time, wall-clock time, interaction count. |
+| `get_plan_usage` | Returns full billing cycle info (limit, used, remaining, overage). |
+| `get_session_summary` | Markdown-formatted summary for Jira/PR comments. |
+
 ## Supported Platforms
 
-| OS | State DB Path |
-|----|---------------|
+| OS | Kiro State Path |
+|----|-----------------|
 | Windows | `%APPDATA%\Kiro\User\globalStorage\state.vscdb` |
 | macOS | `~/Library/Application Support/Kiro/User/globalStorage/state.vscdb` |
 | Linux | `~/.config/Kiro/User/globalStorage/state.vscdb` |
@@ -81,13 +77,22 @@ Then in `.kiro/settings/mcp.json`:
 ## Requirements
 
 - Python 3.10+
-- Kiro IDE installed and opened at least once (so the state DB exists)
+- Kiro IDE installed and opened at least once
 
-## How it works
+## How It Works
 
-Kiro stores usage data in a local SQLite database (`state.vscdb`) under the key `kiro.kiroAgent`. This includes a `resourceNotifications.usageState` object that the IDE UI uses to render the "Est. Credits Used" badge. This MCP server reads that same data and exposes it as a tool agents can call.
+Kiro stores plan usage in a local SQLite database. The UI renders "Est. Credits Used" from this data after every response. KiroStats reads the same cache and exposes it to agents via MCP tools.
 
-The data refreshes whenever Kiro syncs with AWS (typically every few minutes while the IDE is open).
+Session tracking works by snapshotting the `currentUsage` value at chat start, then computing the delta on each query. Thinking time is logged per-turn by the agent. Wall-clock time is the elapsed time since `start_session` was called.
+
+## Uninstall
+
+```powershell
+pip uninstall kiro-usage-mcp
+# Remove from ~/.kiro/settings/mcp.json
+# Delete ~/.kiro/hooks/kiro-stats-session.json
+# Delete ~/.kiro/steering/kiro-stats.md
+```
 
 ## License
 
