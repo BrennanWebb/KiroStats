@@ -37,9 +37,15 @@ if (-not (Test-Path $mcpConfigDir)) {
     New-Item -ItemType Directory -Path $mcpConfigDir -Force | Out-Null
 }
 
-# Build the server entry we want to ensure exists
+# Build the server entry — use full python path to avoid PATH issues
+$pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $pythonExe) {
+    $pythonExe = "python"
+}
+
 $serverEntry = @{
-    command = "kiro-usage-mcp"
+    command = $pythonExe
+    args = @("-m", "kiro_usage_mcp.server")
     disabled = $false
     autoApprove = @("start_session", "log_interaction", "get_session_stats", "get_plan_usage", "get_session_summary")
 }
