@@ -83,7 +83,7 @@ $statsContent = @'
 inclusion: manual
 ---
 
-Call `get_session_stats` from the kiro-stats MCP server and report the results to the user.
+Call `get_session_stats` from the kiro-stats MCP server.
 '@
 
 $statsContent | Set-Content (Join-Path $steeringDir "stats.md") -Encoding UTF8
