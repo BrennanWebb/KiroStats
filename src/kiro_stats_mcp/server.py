@@ -67,6 +67,7 @@ def _get_session_data(chat_session_id: str, workspace: Path) -> dict:
     total_credits = 0.0
     thinking_ms = 0
     turns = 0
+    first_start = None
 
     for sd in [d for d in workspace.iterdir() if d.is_dir() and re.match(r'^[a-f0-9]{32}$', d.name)]:
         for f in sd.iterdir():
@@ -86,17 +87,25 @@ def _get_session_data(chat_session_id: str, workspace: Path) -> dict:
                 total_credits += entry.get("usage", 0)
                 turns += 1
 
-            # Thinking time = endTime - startTime per execution
+            # Track earliest start for session time
             start = data.get("startTime")
+            if start and (first_start is None or start < first_start):
+                first_start = start
+
+            # Agent time = sum of individual execution durations
             end = data.get("endTime")
             if start and end:
                 thinking_ms += end - start
             elif start and data.get("status") == "running":
                 thinking_ms += int(time.time() * 1000) - start
 
+    # Session time = first execution start to now
+    session_ms = (int(time.time() * 1000) - first_start) if first_start else 0
+
     return {
         "credits": round(total_credits, 4),
-        "thinking_ms": thinking_ms,
+        "agent_ms": thinking_ms,
+        "session_ms": session_ms,
         "turns": turns,
     }
 
@@ -190,12 +199,11 @@ def get_session_stats(session_id: Optional[str] = None) -> dict:
         return {"error": "Cannot find active Kiro chat session."}
 
     data = _get_session_data(chat_id, ws)
-    wall_ms = int((time.time() - session["start_time"]) * 1000)
 
     return {
         "credits_used": data["credits"],
-        "agent_time": _fmt(data["thinking_ms"]),
-        "session_time": _fmt(wall_ms),
+        "agent_time": _fmt(data["agent_ms"]),
+        "session_time": _fmt(data["session_ms"]),
     }
 
 
