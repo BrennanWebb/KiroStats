@@ -1,11 +1,4 @@
-"""
-KiroStats MCP Server
-
-Reads live session data from Kiro's execution files:
-- Est. Credits Used (sum of usageSummary[].usage)
-- Agent Time (sum of execution durations)
-- Session Time (first execution start to now)
-"""
+"""KiroStats MCP Server — exposes live session metrics."""
 
 import json
 import os
@@ -16,10 +9,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-mcp = FastMCP(
-    name="kiro-stats",
-    instructions="Call get_session_stats for live credit and timing metrics.",
-)
+mcp = FastMCP(name="kiro-stats")
 
 
 def _agent_storage() -> Path:
@@ -107,13 +97,8 @@ def _fmt(ms: int) -> str:
     return f"{h}h {m}m"
 
 
-@mcp.tool()
+@mcp.tool(description="Get current session credits and timing.")
 def get_session_stats() -> dict:
-    """
-    Get live metrics for the current Kiro chat session.
-
-    Returns credits_used, agent_time, and session_time.
-    """
     result = _find_running()
     if not result:
         return {"error": "No active Kiro chat session found."}
