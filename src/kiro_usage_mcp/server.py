@@ -194,8 +194,8 @@ def get_session_stats(session_id: Optional[str] = None) -> dict:
 
     return {
         "credits_used": data["credits"],
-        "thinking_time": _fmt(data["thinking_ms"]),
-        "wall_clock": _fmt(wall_ms),
+        "agent_time": _fmt(data["thinking_ms"]),
+        "session_time": _fmt(wall_ms),
     }
 
 
