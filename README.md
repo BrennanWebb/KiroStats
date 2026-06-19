@@ -38,7 +38,7 @@ cd KiroStats
 The installer:
 1. Pip-installs the MCP server package
 2. Registers it in your user-level `~/.kiro/settings/mcp.json`
-3. Creates steering files (`#start` and `#credits`) for manual invocation
+3. Creates steering files (`/start` and `/credits`) for manual invocation
 
 **Restart Kiro after install.**
 
@@ -65,8 +65,8 @@ Copy `.kiro/steering/start.md` and `.kiro/steering/credits.md` from this repo to
 ## Usage
 
 In any Kiro chat:
-- **`#start`** — begins session tracking (call once per chat)
-- **`#credits`** — reports credits used, agent time, session time
+- **`/start`** — begins session tracking (call once per chat)
+- **`/credits`** — reports credits used, agent time, session time
 
 ## Tools
 
