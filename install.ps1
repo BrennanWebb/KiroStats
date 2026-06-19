@@ -65,7 +65,10 @@ if (Test-Path $mcpConfigPath) {
     }
 }
 
-$mcpConfig | ConvertTo-Json -Depth 10 | Set-Content $mcpConfigPath -Encoding UTF8
+# Use Python for JSON serialization to get clean 2-space indentation
+$mcpConfig | ConvertTo-Json -Depth 10 -Compress |
+    python -c "import sys, json; obj = json.loads(sys.stdin.read()); print(json.dumps(obj, indent=2))" |
+    Set-Content $mcpConfigPath -Encoding UTF8
 Write-Host "  OK - Added to $mcpConfigPath" -ForegroundColor Green
 
 # --- Step 3: Create steering file ---
