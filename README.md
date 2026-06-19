@@ -6,36 +6,28 @@ No auth. No network. No cloud dependency. Reads directly from Kiro's local execu
 
 ## What You Get
 
-Once installed, Kiro automatically tracks every chat session:
+Three metrics, live from the same source that powers Kiro's "Est. Credits Used" display:
 
-- **Session credits** — exact per-turn credits from Kiro's execution files (same source as the UI)
-- **Thinking time** — cumulative seconds the agent spent processing
-- **Wall-clock time** — how long the chat has been open
-- **Tool cost breakdown** — which tools are consuming the most credits
-- **Plan usage** — monthly limit, used, remaining, overage charges
-- **Jira-ready summaries** — markdown output you can paste or auto-attach to tickets
-
-Ask at any point:
-> "What's my credit usage this session?"
-> "How long has Kiro been thinking?"
-> "How long has this chat been open?"
-> "Give me a session summary for Jira."
+- **Credits Used** — exact per-turn credits from execution files
+- **Agent Time** — cumulative time Kiro spent processing (sum of execution durations)
+- **Session Time** — wall-clock time since you started tracking
 
 ## How It Works
 
-Kiro persists every agent execution to disk as JSON files containing `usageSummary[]` arrays with exact per-turn credit values. KiroStats reads these files directly — the same data that feeds the "Est. Credits Used" display in the UI.
+Kiro persists every agent execution to disk as JSON files containing `usageSummary[]` arrays with exact per-turn credit values. KiroStats reads these files directly.
 
-**Data sources:**
-- **Per-turn credits:** `%APPDATA%/Kiro/User/globalStorage/kiro.kiroagent/{workspace-hash}/{session-hash}/{execution-hash}`
-- **Plan totals:** `%APPDATA%/Kiro/User/globalStorage/state.vscdb`
+**Data source:**
+```
+%APPDATA%/Kiro/User/globalStorage/kiro.kiroagent/{workspace-hash}/{session-hash}/{execution-hash}
+```
 
 Session tracking works by:
 1. Finding the currently "running" execution file
 2. Identifying the `chatSessionId` to group all executions in this chat
 3. Summing `usageSummary[].usage` across all matching executions
-4. Reporting elapsed time from `startTime` of the first execution
+4. Computing agent time from `startTime`/`endTime` of each execution
 
-## Install (One Command)
+## Install
 
 ```powershell
 git clone https://github.com/BrennanWebb/KiroStats.git
@@ -46,12 +38,11 @@ cd KiroStats
 The installer:
 1. Pip-installs the MCP server package
 2. Registers it in your user-level `~/.kiro/settings/mcp.json`
-3. Creates a hook that auto-starts session tracking on every chat
-4. Creates a steering file so the agent knows how to use the tools
+3. Creates steering files (`#start` and `#credits`) for manual invocation
 
-**Restart Kiro after install.** Session tracking begins on your next chat.
+**Restart Kiro after install.**
 
-## Manual Install (if you prefer)
+## Manual Install
 
 ```bash
 pip install -e .
@@ -69,17 +60,20 @@ Add to `~/.kiro/settings/mcp.json`:
 }
 ```
 
-Then copy the hook and steering files from the install script, or create them manually.
+Copy `.kiro/steering/start.md` and `.kiro/steering/credits.md` from this repo to `~/.kiro/steering/`.
+
+## Usage
+
+In any Kiro chat:
+- **`#start`** — begins session tracking (call once per chat)
+- **`#credits`** — reports credits used, agent time, session time
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `start_session` | Finds the running execution, captures chatSessionId. Called automatically by hook. |
-| `log_interaction` | Records thinking time for an agent turn. |
-| `get_session_stats` | Returns session credits (from execution files), thinking time, wall-clock time, tool breakdown. |
-| `get_plan_usage` | Returns full billing cycle info (limit, used, remaining, overage). |
-| `get_session_summary` | Markdown-formatted summary for Jira/PR comments. |
+| `start_session` | Finds the running execution, captures chatSessionId. Idempotent. |
+| `get_session_stats` | Returns credits_used, agent_time, session_time. |
 
 ## Supported Platforms
 
@@ -98,7 +92,7 @@ Then copy the hook and steering files from the install script, or create them ma
 
 ```powershell
 pip uninstall kiro-stats-mcp
-# Remove from ~/.kiro/settings/mcp.json
+# Remove "kiro-stats" from ~/.kiro/settings/mcp.json
 # Delete ~/.kiro/steering/start.md
 # Delete ~/.kiro/steering/credits.md
 ```
