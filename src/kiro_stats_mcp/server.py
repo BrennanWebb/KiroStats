@@ -3,8 +3,8 @@ KiroStats MCP Server
 
 Reads live session data from Kiro's execution files:
 - Est. Credits Used (sum of usageSummary[].usage)
-- Thinking Time (sum of execution durations)
-- Wall Clock Time (time since session start)
+- Agent Time (sum of execution durations)
+- Session Time (first execution start to now)
 """
 
 import json
@@ -12,23 +12,14 @@ import os
 import platform
 import re
 import time
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from fastmcp import FastMCP
 
 mcp = FastMCP(
     name="kiro-stats",
-    instructions=(
-        "Tracks Kiro session credit usage and timing. "
-        "Call start_session once per chat. Call get_session_stats for live metrics."
-    ),
+    instructions="Call get_session_stats for live credit and timing metrics.",
 )
-
-_sessions: dict = {}
-_active_session_id: Optional[str] = None
 
 
 def _agent_storage() -> Path:
@@ -42,7 +33,7 @@ def _agent_storage() -> Path:
         return Path(config) / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
 
 
-def _find_running() -> Optional[tuple[str, Path]]:
+def _find_running() -> tuple[str, Path] | None:
     """Find the running execution's chatSessionId and its workspace dir."""
     root = _agent_storage()
     if not root.exists():
@@ -63,9 +54,9 @@ def _find_running() -> Optional[tuple[str, Path]]:
 
 
 def _get_session_data(chat_session_id: str, workspace: Path) -> dict:
-    """Read all executions for a chat session. Returns credits, thinking time."""
+    """Read all executions for a chat session."""
     total_credits = 0.0
-    thinking_ms = 0
+    agent_ms = 0
     turns = 0
     first_start = None
 
@@ -82,31 +73,26 @@ def _get_session_data(chat_session_id: str, workspace: Path) -> dict:
             if "usageSummary" not in data:
                 continue
 
-            # Credits
             for entry in data["usageSummary"]:
                 total_credits += entry.get("usage", 0)
                 turns += 1
 
-            # Track earliest start for session time
             start = data.get("startTime")
             if start and (first_start is None or start < first_start):
                 first_start = start
 
-            # Agent time = sum of individual execution durations
             end = data.get("endTime")
             if start and end:
-                thinking_ms += end - start
+                agent_ms += end - start
             elif start and data.get("status") == "running":
-                thinking_ms += int(time.time() * 1000) - start
+                agent_ms += int(time.time() * 1000) - start
 
-    # Session time = first execution start to now
     session_ms = (int(time.time() * 1000) - first_start) if first_start else 0
 
     return {
         "credits": round(total_credits, 4),
-        "agent_ms": thinking_ms,
+        "agent_ms": agent_ms,
         "session_ms": session_ms,
-        "turns": turns,
     }
 
 
@@ -122,82 +108,17 @@ def _fmt(ms: int) -> str:
 
 
 @mcp.tool()
-def start_session() -> dict:
+def get_session_stats() -> dict:
     """
-    Start tracking a new chat session. Call this ONCE at the beginning of
-    every chat session.
+    Get live metrics for the current Kiro chat session.
 
-    Captures a snapshot of current plan credits and wall-clock time so that
-    subsequent calls to get_session_stats can calculate deltas.
-
-    Returns the session_id and starting credit balance.
+    Returns credits_used, agent_time, and session_time.
     """
-    global _active_session_id
-
-    # If we already have an active session, just return it (idempotent)
-    if _active_session_id and _active_session_id in _sessions:
-        session = _sessions[_active_session_id]
-        return {
-            "session_id": _active_session_id,
-            "started_at": datetime.fromtimestamp(session["start_time"], tz=timezone.utc).isoformat(),
-            "already_active": True,
-            "message": "Session already active.",
-        }
-
-    session_id = str(uuid.uuid4())[:8]
-    now = time.time()
-
     result = _find_running()
-    chat_id, workspace = result if result else (None, None)
+    if not result:
+        return {"error": "No active Kiro chat session found."}
 
-    _sessions[session_id] = {
-        "start_time": now,
-        "chat_session_id": chat_id,
-        "workspace": workspace,
-    }
-    _active_session_id = session_id
-
-    return {
-        "session_id": session_id,
-        "started_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
-        "starting_credits_used": 0,
-        "message": "Session tracking started. Call get_session_stats at any time for metrics.",
-    }
-
-
-@mcp.tool()
-def get_session_stats(session_id: Optional[str] = None) -> dict:
-    """
-    Get current metrics for a chat session.
-
-    Returns:
-    - session_credits: Credits consumed during this session (delta from start)
-    - total_thinking_time: Cumulative agent processing time
-    - wall_clock_time: Total time since session started
-    - interaction_count: Number of agent turns logged
-
-    Parameters:
-        session_id: Which session to query. Uses active session if not provided.
-    """
-    sid = session_id or _active_session_id
-    if not sid or sid not in _sessions:
-        return {"error": "No active session. Call start_session first."}
-
-    session = _sessions[sid]
-
-    # Retry finding chat session if not captured at start
-    chat_id = session.get("chat_session_id")
-    ws = session.get("workspace")
-    if not chat_id:
-        result = _find_running()
-        if result:
-            chat_id, ws = result
-            session["chat_session_id"] = chat_id
-            session["workspace"] = ws
-
-    if not chat_id or not ws:
-        return {"error": "Cannot find active Kiro chat session."}
-
+    chat_id, ws = result
     data = _get_session_data(chat_id, ws)
 
     return {

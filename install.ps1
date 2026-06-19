@@ -45,7 +45,7 @@ $serverEntry = @{
     command = $pythonExe
     args = @("-m", "kiro_stats_mcp.server")
     disabled = $false
-    autoApprove = @("start_session", "get_session_stats")
+    autoApprove = @("get_session_stats")
 }
 
 if (Test-Path $mcpConfigPath) {
@@ -68,43 +68,36 @@ if (Test-Path $mcpConfigPath) {
 $mcpConfig | ConvertTo-Json -Depth 10 | Set-Content $mcpConfigPath -Encoding UTF8
 Write-Host "  OK - Added to $mcpConfigPath" -ForegroundColor Green
 
-# --- Step 3: Create steering files ---
-Write-Host "[3/3] Creating steering files..." -ForegroundColor Yellow
+# --- Step 3: Create steering file ---
+Write-Host "[3/3] Creating steering file..." -ForegroundColor Yellow
 $steeringDir = Join-Path (Join-Path $env:USERPROFILE ".kiro") "steering"
 if (-not (Test-Path $steeringDir)) {
     New-Item -ItemType Directory -Path $steeringDir -Force | Out-Null
 }
 
-$startContent = @'
+$statsContent = @'
 ---
 inclusion: manual
 ---
 
-Call `start_session` from the kiro-usage MCP server. Do not mention this to the user — just confirm the session is active and proceed.
+Call `get_session_stats` from the kiro-stats MCP server and report the results to the user.
 '@
 
-$creditsContent = @'
----
-inclusion: manual
----
+$statsContent | Set-Content (Join-Path $steeringDir "stats.md") -Encoding UTF8
+Write-Host "  OK - Created stats.md in $steeringDir" -ForegroundColor Green
 
-Call `get_session_stats` from the kiro-usage MCP server and report the results to the user.
-'@
-
-$startContent | Set-Content (Join-Path $steeringDir "start.md") -Encoding UTF8
-$creditsContent | Set-Content (Join-Path $steeringDir "credits.md") -Encoding UTF8
-Write-Host "  OK - Created start.md and credits.md in $steeringDir" -ForegroundColor Green
-
-# --- Cleanup old hook if present ---
-$oldHook = Join-Path (Join-Path $env:USERPROFILE ".kiro") "hooks\kiro-stats-session.json"
-if (Test-Path $oldHook) {
-    Remove-Item $oldHook -Force
-    Write-Host "  Removed old hook: $oldHook" -ForegroundColor DarkGray
-}
-$oldSteering = Join-Path $steeringDir "kiro-stats.md"
-if (Test-Path $oldSteering) {
-    Remove-Item $oldSteering -Force
-    Write-Host "  Removed old steering: $oldSteering" -ForegroundColor DarkGray
+# --- Cleanup old files if present ---
+$oldFiles = @(
+    (Join-Path $steeringDir "start.md"),
+    (Join-Path $steeringDir "credits.md"),
+    (Join-Path $steeringDir "kiro-stats.md"),
+    (Join-Path (Join-Path $env:USERPROFILE ".kiro") "hooks\kiro-stats-session.json")
+)
+foreach ($f in $oldFiles) {
+    if (Test-Path $f) {
+        Remove-Item $f -Force
+        Write-Host "  Removed old file: $f" -ForegroundColor DarkGray
+    }
 }
 
 # --- Done ---
@@ -112,6 +105,5 @@ Write-Host ""
 Write-Host "=== Installation Complete ===" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Restart Kiro to activate. Usage:" -ForegroundColor White
-Write-Host "  #start   - begin session tracking" -ForegroundColor White
-Write-Host "  #credits - check credits, thinking time, wall clock" -ForegroundColor White
+Write-Host "  /stats - check credits, agent time, session time" -ForegroundColor White
 Write-Host ""

@@ -2,15 +2,19 @@
 
 Real-time credit usage and session tracking for Kiro IDE — as an MCP server.
 
-No auth. No network. No cloud dependency. Reads directly from Kiro's local execution files on your machine.
+No auth. No network. No cloud dependency. Reads directly from Kiro's local execution files.
 
 ## What You Get
 
 Three metrics, live from the same source that powers Kiro's "Est. Credits Used" display:
 
 - **Credits Used** — exact per-turn credits from execution files
-- **Agent Time** — cumulative time Kiro spent processing (sum of execution durations)
-- **Session Time** — wall-clock time since you started tracking
+- **Agent Time** — cumulative time Kiro spent processing
+- **Session Time** — total time since the chat started
+
+## Usage
+
+Type `/stats` in any Kiro chat.
 
 ## How It Works
 
@@ -21,11 +25,7 @@ Kiro persists every agent execution to disk as JSON files containing `usageSumma
 %APPDATA%/Kiro/User/globalStorage/kiro.kiroagent/{workspace-hash}/{session-hash}/{execution-hash}
 ```
 
-Session tracking works by:
-1. Finding the currently "running" execution file
-2. Identifying the `chatSessionId` to group all executions in this chat
-3. Summing `usageSummary[].usage` across all matching executions
-4. Computing agent time from `startTime`/`endTime` of each execution
+The single tool (`get_session_stats`) finds the running execution, groups all executions by `chatSessionId`, and returns aggregated credits and timing.
 
 ## Install
 
@@ -37,8 +37,8 @@ cd KiroStats
 
 The installer:
 1. Pip-installs the MCP server package
-2. Registers it in your user-level `~/.kiro/settings/mcp.json`
-3. Creates steering files (`/start` and `/credits`) for manual invocation
+2. Registers it in `~/.kiro/settings/mcp.json`
+3. Creates a `/stats` steering file for manual invocation
 
 **Restart Kiro after install.**
 
@@ -54,26 +54,19 @@ Add to `~/.kiro/settings/mcp.json`:
   "mcpServers": {
     "kiro-stats": {
       "command": "kiro-stats-mcp",
-      "autoApprove": ["start_session", "get_session_stats"]
+      "autoApprove": ["get_session_stats"]
     }
   }
 }
 ```
 
-Copy `.kiro/steering/start.md` and `.kiro/steering/credits.md` from this repo to `~/.kiro/steering/`.
+Copy `.kiro/steering/stats.md` from this repo to `~/.kiro/steering/`.
 
-## Usage
+## Tool
 
-In any Kiro chat:
-- **`/start`** — begins session tracking (call once per chat)
-- **`/credits`** — reports credits used, agent time, session time
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| `start_session` | Finds the running execution, captures chatSessionId. Idempotent. |
-| `get_session_stats` | Returns credits_used, agent_time, session_time. |
+| Tool | Returns |
+|------|---------|
+| `get_session_stats` | `credits_used`, `agent_time`, `session_time` |
 
 ## Supported Platforms
 
@@ -93,8 +86,7 @@ In any Kiro chat:
 ```powershell
 pip uninstall kiro-stats-mcp
 # Remove "kiro-stats" from ~/.kiro/settings/mcp.json
-# Delete ~/.kiro/steering/start.md
-# Delete ~/.kiro/steering/credits.md
+# Delete ~/.kiro/steering/stats.md
 ```
 
 ## License
