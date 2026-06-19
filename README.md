@@ -61,9 +61,9 @@ Add to `~/.kiro/settings/mcp.json`:
 ```json
 {
   "mcpServers": {
-    "kiro-usage": {
-      "command": "kiro-usage-mcp",
-      "autoApprove": ["start_session", "log_interaction", "get_session_stats", "get_plan_usage", "get_session_summary"]
+    "kiro-stats": {
+      "command": "kiro-stats-mcp",
+      "autoApprove": ["start_session", "get_session_stats"]
     }
   }
 }
@@ -97,10 +97,10 @@ Then copy the hook and steering files from the install script, or create them ma
 ## Uninstall
 
 ```powershell
-pip uninstall kiro-usage-mcp
+pip uninstall kiro-stats-mcp
 # Remove from ~/.kiro/settings/mcp.json
-# Delete ~/.kiro/hooks/kiro-stats-session.json
-# Delete ~/.kiro/steering/kiro-stats.md
+# Delete ~/.kiro/steering/start.md
+# Delete ~/.kiro/steering/credits.md
 ```
 
 ## License

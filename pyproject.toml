@@ -1,7 +1,7 @@
 [project]
-name = "kiro-usage-mcp"
-version = "0.1.0"
-description = "Local MCP server that exposes Kiro IDE credit usage to agents"
+name = "kiro-stats-mcp"
+version = "2.0.0"
+description = "Local MCP server that exposes Kiro IDE credit usage and session timing to agents"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-kiro-usage-mcp = "kiro_usage_mcp.server:main"
+kiro-stats-mcp = "kiro_stats_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]

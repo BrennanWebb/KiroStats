@@ -43,7 +43,7 @@ if (-not $pythonExe) {
 
 $serverEntry = @{
     command = $pythonExe
-    args = @("-m", "kiro_usage_mcp.server")
+    args = @("-m", "kiro_stats_mcp.server")
     disabled = $false
     autoApprove = @("start_session", "get_session_stats")
 }
@@ -53,14 +53,14 @@ if (Test-Path $mcpConfigPath) {
     if (-not $mcpConfig.mcpServers) {
         $mcpConfig | Add-Member -NotePropertyName "mcpServers" -NotePropertyValue (New-Object PSObject)
     }
-    if ($mcpConfig.mcpServers.PSObject.Properties["kiro-usage"]) {
-        $mcpConfig.mcpServers.PSObject.Properties.Remove("kiro-usage")
+    if ($mcpConfig.mcpServers.PSObject.Properties["kiro-stats"]) {
+        $mcpConfig.mcpServers.PSObject.Properties.Remove("kiro-stats")
     }
-    $mcpConfig.mcpServers | Add-Member -NotePropertyName "kiro-usage" -NotePropertyValue ([PSCustomObject]$serverEntry)
+    $mcpConfig.mcpServers | Add-Member -NotePropertyName "kiro-stats" -NotePropertyValue ([PSCustomObject]$serverEntry)
 } else {
     $mcpConfig = [PSCustomObject]@{
         mcpServers = [PSCustomObject]@{
-            "kiro-usage" = [PSCustomObject]$serverEntry
+            "kiro-stats" = [PSCustomObject]$serverEntry
         }
     }
 }

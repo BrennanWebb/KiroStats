@@ -20,7 +20,7 @@ from typing import Optional
 from fastmcp import FastMCP
 
 mcp = FastMCP(
-    name="kiro-usage",
+    name="kiro-stats",
     instructions=(
         "Tracks Kiro session credit usage and timing. "
         "Call start_session once per chat. Call get_session_stats for live metrics."
