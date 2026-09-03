@@ -104,19 +104,42 @@ The installer:
 pip install -e .
 ```
 
-Add to `~/.kiro/settings/mcp.json`:
+Find the absolute path of the interpreter you just installed into:
+
+```bash
+python -c "import sys; print(sys.executable)"
+```
+
+Add to `~/.kiro/settings/mcp.json`, using that path:
+
 ```json
 {
   "mcpServers": {
     "kiro-stats": {
-      "command": "kiro-stats-mcp",
+      "command": "C:\\Path\\To\\python.exe",
+      "args": ["-m", "kiro_stats_mcp.server"],
+      "disabled": false,
       "autoApprove": ["get_session_stats"]
     }
   }
 }
 ```
 
-Copy `.kiro/steering/stats.md` from this repo to `~/.kiro/steering/`.
+Copy `.kiro/steering/stats.md` from this repo to `~/.kiro/steering/`, and make
+sure it is saved **without a BOM** — a BOM ahead of the `---` breaks front-matter
+parsing.
+
+Two reasons for the absolute path and `-m` form rather than the `kiro-stats-mcp`
+console script:
+
+- pip installs that script into a `Scripts` directory that is often not on PATH,
+  and Kiro launches MCP servers without a shell
+- on Windows 10/11, bare `python` frequently resolves to the Microsoft Store app
+  execution alias in `WindowsApps`, a stub that can open the Store instead of
+  running Python
+
+`sys.executable` sidesteps both. The console script still works if its directory
+is on your PATH.
 
 ## Tool
 
