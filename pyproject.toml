@@ -1,6 +1,6 @@
 [project]
 name = "kiro-stats-mcp"
-version = "2.0.0"
+version = "3.0.0"
 description = "Local MCP server that exposes Kiro IDE credit usage and session timing to agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -9,9 +9,17 @@ dependencies = [
     "fastmcp>=2.0.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
 [project.scripts]
 kiro-stats-mcp = "kiro_stats_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

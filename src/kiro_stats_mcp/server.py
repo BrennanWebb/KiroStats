@@ -1,92 +1,20 @@
-"""KiroStats MCP Server — exposes live session metrics."""
+"""KiroStats MCP Server — exposes live session metrics.
 
-import json
-import os
-import platform
-import re
-import time
-from pathlib import Path
+Supports both Kiro storage layouts: the pre-1.0 execution files under
+globalStorage and the 1.0+ session logs under ``~/.kiro/sessions``. See
+``readers.py`` for the details of each.
+"""
 
 from fastmcp import FastMCP
+
+from .readers import read_stats
 
 mcp = FastMCP(name="kiro-stats")
 
 
-def _agent_storage() -> Path:
-    system = platform.system()
-    if system == "Windows":
-        return Path(os.environ["APPDATA"]) / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
-    elif system == "Darwin":
-        return Path.home() / "Library" / "Application Support" / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
-    else:
-        config = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-        return Path(config) / "Kiro" / "User" / "globalStorage" / "kiro.kiroagent"
-
-
-def _find_running() -> tuple[str, Path] | None:
-    """Find the running execution's chatSessionId and its workspace dir."""
-    root = _agent_storage()
-    if not root.exists():
+def _fmt(ms: int | None) -> str | None:
+    if ms is None:
         return None
-    for ws in sorted(
-        [d for d in root.iterdir() if d.is_dir() and re.match(r'^[a-f0-9]{32}$', d.name)],
-        key=lambda d: d.stat().st_mtime, reverse=True,
-    ):
-        for sd in [d for d in ws.iterdir() if d.is_dir() and re.match(r'^[a-f0-9]{32}$', d.name)]:
-            for f in sorted(sd.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True)[:5]:
-                try:
-                    data = json.loads(f.read_text(encoding="utf-8"))
-                    if data.get("status") == "running" and "chatSessionId" in data:
-                        return data["chatSessionId"], ws
-                except (json.JSONDecodeError, OSError):
-                    continue
-    return None
-
-
-def _get_session_data(chat_session_id: str, workspace: Path) -> dict:
-    """Read all executions for a chat session."""
-    total_credits = 0.0
-    agent_ms = 0
-    turns = 0
-    first_start = None
-
-    for sd in [d for d in workspace.iterdir() if d.is_dir() and re.match(r'^[a-f0-9]{32}$', d.name)]:
-        for f in sd.iterdir():
-            if not f.is_file():
-                continue
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            if data.get("chatSessionId") != chat_session_id:
-                continue
-            if "usageSummary" not in data:
-                continue
-
-            for entry in data["usageSummary"]:
-                total_credits += entry.get("usage", 0)
-                turns += 1
-
-            start = data.get("startTime")
-            if start and (first_start is None or start < first_start):
-                first_start = start
-
-            end = data.get("endTime")
-            if start and end:
-                agent_ms += end - start
-            elif start and data.get("status") == "running":
-                agent_ms += int(time.time() * 1000) - start
-
-    session_ms = (int(time.time() * 1000) - first_start) if first_start else 0
-
-    return {
-        "credits": round(total_credits, 4),
-        "agent_ms": agent_ms,
-        "session_ms": session_ms,
-    }
-
-
-def _fmt(ms: int) -> str:
     s = ms // 1000
     if s < 60:
         return f"{s}s"
@@ -98,19 +26,52 @@ def _fmt(ms: int) -> str:
 
 
 @mcp.tool(description="Get current session credits and timing.")
-def get_session_stats() -> dict:
-    result = _find_running()
-    if not result:
+def get_session_stats(layout: str = "auto", workspace_path: str | None = None) -> dict:
+    """Return credits and timing for the active Kiro chat session.
+
+    Args:
+        layout: Storage layout to read. ``auto`` (default) prefers the Kiro 1.0+
+            layout and falls back to pre-1.0. Force one with ``v1`` or ``legacy``.
+        workspace_path: Optional absolute path. When several sessions are open,
+            restricts the search to sessions bound to this workspace. Kiro 1.0+
+            only, since pre-1.0 execution files did not record workspace paths.
+    """
+    try:
+        data = read_stats(layout, workspace_path)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if not data:
         return {"error": "No active Kiro chat session found."}
 
-    chat_id, ws = result
-    data = _get_session_data(chat_id, ws)
-
-    return {
-        "credits_used": data["credits"],
+    result = {
+        "credits_used": round(data["credits"], 4),
         "agent_time": _fmt(data["agent_ms"]),
         "session_time": _fmt(data["session_ms"]),
+        "turns": data["turns"],
+        "source": data["source"],
+        "session_id": data["session_id"],
     }
+
+    # Per-turn figures exist only in 1.0+, where they match the number Kiro
+    # shows in the chat footer for the last completed turn.
+    if data["last_turn_credits"] is not None:
+        result["last_turn_credits"] = round(data["last_turn_credits"], 4)
+        result["last_turn_time"] = _fmt(data["last_turn_ms"])
+
+    notes = []
+    if data["turn_in_flight"]:
+        notes.append("Current turn still running; totals cover completed turns only.")
+    if data["ambiguous"]:
+        # Several windows were mid-turn, so the session was chosen heuristically.
+        notes.append(
+            "Multiple live sessions; pass workspace_path to target this one. "
+            f"Reporting on {data['workspace_paths']}."
+        )
+    if notes:
+        result["note"] = " ".join(notes)
+
+    return result
 
 
 def main():
