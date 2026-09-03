@@ -29,6 +29,30 @@ function Write-TextFile($Path, $Content) {
     [System.IO.File]::WriteAllText($Path, $Content, $Utf8NoBom)
 }
 
+# Run a native command and report its exit code without letting stderr abort us.
+# pip and git routinely write notices to stderr while exiting 0 (for example
+# "[notice] A new release of pip is available"). Under
+# ErrorActionPreference=Stop, Windows PowerShell promotes native stderr output
+# to a terminating error, which would kill this script mid-install even though
+# the command succeeded. The exit code is the only reliable signal.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string] $Exe,
+        [string[]] $Arguments = @()
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $Exe @Arguments 2>&1
+        return [pscustomobject]@{
+            ExitCode = $LASTEXITCODE
+            Output   = $output
+        }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 # --- Step 1: Locate a Python interpreter ---
 Write-Host "[1/4] Locating Python..." -ForegroundColor Yellow
 
@@ -49,12 +73,15 @@ foreach ($c in $candidates) {
     # execution alias under WindowsApps, which is a stub that can launch the
     # Store instead of Python. sys.executable always gives the real binary,
     # and guarantees we record the same interpreter that runs the install.
-    $probe = & $c.File @($c.Pre + @("-c", "import sys; print(sys.executable); print('%d.%d' % sys.version_info[:2])")) 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $probe) { continue }
+    $probe = Invoke-Native $c.File ($c.Pre + @("-c", "import sys; print(sys.executable); print('%d.%d' % sys.version_info[:2])"))
+    if ($probe.ExitCode -ne 0 -or -not $probe.Output) { continue }
 
-    $exe = ($probe | Select-Object -First 1).Trim()
-    $ver = ($probe | Select-Object -Skip 1 -First 1).Trim()
+    $lines = @($probe.Output | Where-Object { $_ -is [string] -and $_.Trim() })
+    if ($lines.Count -lt 2) { continue }
+    $exe = $lines[0].Trim()
+    $ver = $lines[1].Trim()
     if (-not (Test-Path $exe)) { continue }
+    if ($ver -notmatch '^\d+\.\d+$') { continue }
 
     $parts = $ver.Split('.')
     if ([int]$parts[0] -lt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -lt 10)) {
@@ -78,18 +105,20 @@ if (-not $pythonExe) {
 # --- Step 2: Install the package ---
 Write-Host "[2/4] Installing Python package..." -ForegroundColor Yellow
 $repoRoot = $PSScriptRoot
-& $pythonExe -m pip install -e $repoRoot --quiet --no-warn-script-location
-if ($LASTEXITCODE -ne 0) {
+$pip = Invoke-Native $pythonExe @("-m", "pip", "install", "-e", $repoRoot, "--quiet", "--no-warn-script-location")
+if ($pip.ExitCode -ne 0) {
     Write-Host "ERROR: pip install failed." -ForegroundColor Red
+    $pip.Output | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     exit 1
 }
 
 # Confirm the server module actually imports. The config written below invokes
 # it as `-m kiro_stats_mcp.server`, so failing here beats failing silently
 # inside Kiro at startup.
-& $pythonExe -c "import kiro_stats_mcp.server" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$check = Invoke-Native $pythonExe @("-c", "import kiro_stats_mcp.server")
+if ($check.ExitCode -ne 0) {
     Write-Host "ERROR: kiro_stats_mcp.server does not import after install." -ForegroundColor Red
+    $check.Output | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     exit 1
 }
 Write-Host "  OK - kiro-stats-mcp installed and importable" -ForegroundColor Green
@@ -133,9 +162,16 @@ if (Test-Path $mcpConfigPath) {
 
 # Round-trip through Python for stable 2-space indentation; ConvertTo-Json
 # formatting differs between PowerShell 5.1 and 7.
-$json = $mcpConfig | ConvertTo-Json -Depth 10 -Compress |
-    & $pythonExe -c "import sys, json; print(json.dumps(json.loads(sys.stdin.read()), indent=2))"
-if ($LASTEXITCODE -ne 0 -or -not $json) {
+$compact = $mcpConfig | ConvertTo-Json -Depth 10 -Compress
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $json = $compact | & $pythonExe -c "import sys, json; print(json.dumps(json.loads(sys.stdin.read()), indent=2))" 2>&1
+    $serializeCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+if ($serializeCode -ne 0 -or -not $json) {
     Write-Host "ERROR: failed to serialize $mcpConfigPath" -ForegroundColor Red
     exit 1
 }
@@ -173,14 +209,40 @@ foreach ($f in $oldFiles) {
     }
 }
 
+# --- Verify ---
+# Assert the artifacts actually landed. A silent abort mid-script previously
+# left the package installed but no config and no steering file, which looked
+# like success until you tried to use it.
+$problems = @()
+if (-not (Test-Path $mcpConfigPath)) {
+    $problems += "missing $mcpConfigPath"
+} else {
+    $verify = Invoke-Native $pythonExe @("-c", @"
+import json, sys
+p = sys.argv[1]
+cfg = json.loads(open(p, 'rb').read().decode('utf-8-sig'))
+e = cfg.get('mcpServers', {}).get('kiro-stats')
+assert e, 'kiro-stats entry missing'
+assert e['args'] == ['-m', 'kiro_stats_mcp.server'], 'unexpected args'
+"@, $mcpConfigPath)
+    if ($verify.ExitCode -ne 0) { $problems += "config check failed: $($verify.Output -join ' ')" }
+}
+$statsPath = Join-Path $steeringDir "stats.md"
+if (-not (Test-Path $statsPath)) { $problems += "missing $statsPath" }
+
+if ($problems.Count -gt 0) {
+    Write-Host ""
+    Write-Host "ERROR: install did not complete cleanly:" -ForegroundColor Red
+    $problems | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+    exit 1
+}
+
 # --- Done ---
 Write-Host ""
 Write-Host "=== Installation Complete ===" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Restart Kiro to activate. Usage:" -ForegroundColor White
-Write-Host "  /stats - check credits, agent time, session time" -ForegroundColor White
+Write-Host "Type /stats in any Kiro chat for credits, agent time and session time." -ForegroundColor White
+Write-Host "Kiro normally picks up the server on its own; restart it if /stats does not respond." -ForegroundColor White
 Write-Host ""
 
-# pip writes upgrade notices to stderr, which leaves a nonzero code behind on
-# some hosts. Everything above succeeded or exited, so report success.
 exit 0
