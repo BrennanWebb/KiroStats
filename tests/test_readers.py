@@ -1,6 +1,6 @@
 """Tests for both Kiro storage-layout readers.
 
-Fixtures mirror the real on-disk shapes captured from Kiro 1.0.337 and 0.12.
+Fixtures mirror the real on-disk shapes captured from Kiro 1.0.337, 1.2.56, and 0.12.
 """
 
 import json
@@ -33,8 +33,23 @@ def _usage_record(usage, elapsed_ms, status="success", unit="credit"):
     }
 
 
+def _turn_marker(kind, timestamp, execution_id="exec", stop_reason="end_turn"):
+    payload = {"type": kind, "executionId": execution_id}
+    if kind == "turn_end":
+        payload["stopReason"] = stop_reason
+    return {"id": f"m-{kind}", "timestamp": timestamp, "payload": payload}
+
+
 def _write_v1_session(root, ws_key, sess_id, *, status, created, turns,
-                      workspace_paths=None, model="claude-opus-5"):
+                      workspace_paths=None, model="claude-opus-5",
+                      agent_mode="vibe", markers=False, open_turn_at=None):
+    """Write a session dir.
+
+    ``turns`` is a list of ``(usage, elapsed_ms)``; ``usage=None`` writes a turn
+    with no usage_summary (aborted/unmetered). ``markers`` brackets each turn
+    with turn_start/turn_end. ``open_turn_at`` appends a trailing turn_start at
+    that ISO timestamp with no turn_end.
+    """
     sess = root / ws_key / sess_id
     sess.mkdir(parents=True)
     (sess / "session.json").write_text(json.dumps({
@@ -43,18 +58,32 @@ def _write_v1_session(root, ws_key, sess_id, *, status, created, turns,
         "status": status,
         "createdAt": created,
         "modelId": model,
-        "agentMode": "vibe",
+        "agentMode": agent_mode,
         "workspacePaths": workspace_paths or [],
     }), encoding="utf-8")
 
     lines = []
-    for usage, elapsed in turns:
-        lines.append(json.dumps(_usage_record(usage, elapsed)))
+    for i, (usage, elapsed) in enumerate(turns):
+        exec_id = f"exec-{i}"
+        if markers:
+            lines.append(json.dumps(_turn_marker("turn_start", created, exec_id)))
+        if usage is not None:
+            lines.append(json.dumps(_usage_record(usage, elapsed)))
         # Interleave unrelated records; the reader must skip them.
         lines.append(json.dumps({
             "id": "m", "timestamp": created,
             "payload": {"type": "session_metadata", "key": "contextUsage",
                         "value": {"usagePercentage": 4.2}},
+        }))
+        if markers:
+            lines.append(json.dumps(_turn_marker(
+                "turn_end", created, exec_id,
+                stop_reason="end_turn" if usage is not None else "aborted")))
+    if open_turn_at is not None:
+        lines.append(json.dumps(_turn_marker("turn_start", open_turn_at, "exec-open")))
+        lines.append(json.dumps({
+            "id": "a", "timestamp": open_turn_at,
+            "payload": {"type": "assistant", "content": "working on turn_end soon"},
         }))
     (sess / "messages.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return sess
@@ -258,6 +287,108 @@ def test_v1_sessions_root_is_under_home():
     assert root.parts[-2:] == (".kiro", "sessions")
 
 
+# 2026-08-31T20:00:00Z in epoch ms
+T0_MS = 1788206400000
+
+
+def test_v1_in_flight_turn_time_from_turn_start(v1_root, monkeypatch):
+    """First turn of a fresh session: no credits yet, but elapsed time is known."""
+    _write_v1_session(v1_root, "ws01", "sess_a", status="in_progress",
+                      created="2026-08-31T20:00:00.000Z", turns=[],
+                      open_turn_at="2026-08-31T20:05:00.000Z")
+    monkeypatch.setattr(readers, "_now_ms", lambda: T0_MS + 300_000 + 42_000)
+
+    got = readers.read_v1()
+    assert got["turn_in_flight"] is True
+    assert got["current_turn_ms"] == 42_000
+    assert got["credits"] == 0.0
+    assert got["turns"] == 0
+    # agent_ms stays completed-turns-only.
+    assert got["agent_ms"] == 0
+
+
+def test_v1_in_flight_turn_after_completed_turns(v1_root, monkeypatch):
+    _write_v1_session(v1_root, "ws01", "sess_a", status="in_progress",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(2.5, 1000), (1.5, 2000)], markers=True,
+                      open_turn_at="2026-08-31T20:05:00.000Z")
+    monkeypatch.setattr(readers, "_now_ms", lambda: T0_MS + 300_000 + 7_000)
+
+    got = readers.read_v1()
+    assert got["turns"] == 2
+    assert got["credits"] == pytest.approx(4.0)
+    assert got["agent_ms"] == 3000
+    assert got["current_turn_ms"] == 7_000
+
+
+def test_v1_closed_turn_not_in_flight_even_if_status_in_progress(v1_root):
+    _write_v1_session(v1_root, "ws01", "sess_a", status="in_progress",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(1.0, 1000)], markers=True)
+
+    got = readers.read_v1()
+    assert got["turn_in_flight"] is False
+    assert got["current_turn_ms"] is None
+    assert got["turns"] == 1
+
+
+def test_v1_turns_counts_turn_end_without_usage(v1_root):
+    """An aborted turn with turn_end but no usage_summary still counts."""
+    _write_v1_session(v1_root, "ws01", "sess_a", status="idle",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(1.0, 1000), (None, 0), (2.0, 500)], markers=True)
+
+    got = readers.read_v1()
+    assert got["turns"] == 3
+    assert got["credits"] == pytest.approx(3.0)
+    assert got["agent_ms"] == 1500
+
+
+def test_v1_stale_in_progress_does_not_win(v1_root):
+    import os
+    stale = _write_v1_session(v1_root, "ws01", "sess_stale", status="in_progress",
+                              created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)])
+    _write_v1_session(v1_root, "ws01", "sess_fresh", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(2.0, 200)])
+    old = time.time() - 2 * 3600
+    os.utime(stale / "messages.jsonl", (old, old))
+
+    got = readers.read_v1()
+    assert got["session_id"] == "sess_fresh"
+    assert got["ambiguous"] is False
+    assert got["candidates"] == []
+
+
+def test_v1_ambiguous_with_workspace_path_when_workflow_step_live(v1_root):
+    path = r"c:\repos\KiroStats"
+    _write_v1_session(v1_root, "ws01", "sess_parent", status="in_progress",
+                      created="2026-08-31T20:00:00.000Z", turns=[(3.0, 300)],
+                      workspace_paths=[path], agent_mode="vibe")
+    _write_v1_session(v1_root, "ws01", "sess_step", status="in_progress",
+                      created="2026-08-31T20:00:00.000Z", turns=[],
+                      workspace_paths=[path], agent_mode="wf-planner")
+
+    got = readers.read_v1(path)
+    assert got["ambiguous"] is True
+    assert {(c["session_id"], c["agent_mode"]) for c in got["candidates"]} == {
+        ("sess_parent", "vibe"), ("sess_step", "wf-planner"),
+    }
+
+
+def test_v1_session_id_targets_exact_session(v1_root):
+    path = r"c:\repos\KiroStats"
+    for sid, mode in [("sess_parent", "vibe"), ("sess_step", "wf-planner")]:
+        _write_v1_session(v1_root, "ws01", sid, status="in_progress",
+                          created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                          workspace_paths=[path], agent_mode=mode)
+
+    got = readers.read_v1(session_id="sess_parent")
+    assert got["session_id"] == "sess_parent"
+    assert got["agent_mode"] == "vibe"
+    assert got["ambiguous"] is False
+    assert readers.read_v1(session_id="sess_nope") is None
+
+
 # --------------------------------------------------------------------------
 # pre-1.0 reader
 # --------------------------------------------------------------------------
@@ -410,6 +541,35 @@ def test_tool_notes_ambiguity(v1_root):
     assert "Multiple live sessions" not in get_session_stats(workspace_path=r"c:\a").get("note", "")
 
 
+def test_tool_reports_current_turn_time(v1_root, monkeypatch):
+    _write_v1_session(v1_root, "ws01", "sess_a", status="in_progress",
+                      created="2026-08-31T20:00:00.000Z", turns=[],
+                      open_turn_at="2026-08-31T20:05:00.000Z")
+    monkeypatch.setattr(readers, "_now_ms", lambda: T0_MS + 300_000 + 42_000)
+
+    got = get_session_stats()
+    assert got["current_turn_time"] == "42s"
+    assert got["credits_used"] == 0.0
+    assert "Current turn still running (42s so far)" in got["note"]
+    assert "credits post when it completes" in got["note"]
+
+
+def test_tool_notes_workflow_step_candidates(v1_root):
+    path = r"c:\repos\KiroStats"
+    for sid, mode in [("sess_parent", "vibe"), ("sess_step", "wf-planner")]:
+        _write_v1_session(v1_root, "ws01", sid, status="in_progress",
+                          created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                          workspace_paths=[path], agent_mode=mode)
+
+    note = get_session_stats(workspace_path=path)["note"]
+    assert "Multiple live sessions" in note
+    assert "sess_step (wf-planner)" in note
+    assert "sess_parent (vibe)" in note
+    assert "session_id" in note
+    assert "Multiple live sessions" not in get_session_stats(
+        session_id="sess_parent").get("note", "")
+
+
 def test_tool_omits_per_turn_fields_on_legacy(v1_root, legacy_root):
     _write_legacy_execution(legacy_root, H32_A, H32_B, H32_C,
                             chat_id="chat-1", status="running",
@@ -419,6 +579,7 @@ def test_tool_omits_per_turn_fields_on_legacy(v1_root, legacy_root):
     assert got["source"] == "kiro-0.x"
     assert "last_turn_credits" not in got
     assert "last_turn_time" not in got
+    assert "current_turn_time" not in got
 
 
 def test_tool_reports_no_session(v1_root, legacy_root):

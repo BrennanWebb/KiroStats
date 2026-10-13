@@ -15,10 +15,21 @@ Each blob carries ``chatSessionId``, ``startTime``/``endTime``, ``status`` and a
     ~/.kiro/sessions/{ws-16hex}/sess_{uuid}/session.json
     ~/.kiro/sessions/{ws-16hex}/sess_{uuid}/messages.jsonl
 
-Credits arrive as ``usage_summary`` records appended to ``messages.jsonl`` when a
-turn completes. Mid-turn the metering stream is held in memory by the extension
-and is not observable on disk, so a reading taken during a turn reflects
-everything through the last completed turn.
+Kiro 1.2.x (verified on 1.2.56) still writes this same layout.
+
+Each turn in ``messages.jsonl`` is bracketed by ``turn_start`` and ``turn_end``
+records, with a ``usage_summary`` record (credits and ``elapsedTime``) appended
+just before ``turn_end``. Mid-turn the metering stream is held in memory by the
+extension, so the current turn's credits are unknowable until it ends. Its
+elapsed time is not: an open ``turn_start`` gives the in-flight turn's start, so
+``current_turn_ms`` is reported alongside the completed-turn totals.
+
+Workflow steps (``agentMode`` such as ``wf-planner``) run as separate sessions
+that share the parent chat's ``workspacePaths``. Session selection therefore
+reports every live candidate with its ``agentMode`` and accepts an exact
+``session_id``. A session counts as live only when its status says so *and* its
+log was written recently, so abandoned ``in_progress`` sessions cannot shadow
+the real one.
 """
 
 import json
@@ -31,6 +42,13 @@ from pathlib import Path
 
 # session.json statuses that mean "this session is the one currently talking"
 LIVE_STATUSES = frozenset({"in_progress", "waiting_on_user"})
+
+# A live status older than this (by messages.jsonl mtime) is treated as stale:
+# crashed or abandoned windows leave sessions stuck in_progress indefinitely.
+STALE_LIVE_MS = 30 * 60 * 1000
+
+# Substrings that mark the only messages.jsonl records the reader parses.
+_V1_MARKERS = ("usage_summary", "turn_start", "turn_end")
 
 _HEX32 = re.compile(r"^[a-f0-9]{32}$")
 
@@ -88,11 +106,23 @@ def _v1_iter_session_dirs(root: Path):
                 yield sess, meta
 
 
-def _v1_read_usage(messages: Path) -> dict:
-    """Aggregate the usage_summary records in a messages.jsonl log.
+def _v1_empty_usage() -> dict:
+    return {
+        "credits": 0.0, "agent_ms": 0, "turns": 0, "unit": None,
+        "last_turn_credits": 0.0, "last_turn_ms": 0,
+        "open_turn_start_ms": None, "last_event_ms": None, "turn_open": None,
+    }
 
-    Streams line by line and pre-filters on a substring so large logs stay
+
+def _v1_read_usage(messages: Path) -> dict:
+    """Aggregate turn and usage records in a messages.jsonl log.
+
+    Streams line by line and pre-filters on substrings so large logs stay
     cheap: only candidate lines are handed to the JSON parser.
+
+    ``turns`` counts ``turn_end`` records, falling back to the number of
+    ``usage_summary`` records for logs that carry no turn markers.
+    ``turn_open`` is True/False when turn markers were seen, else None.
     """
     total = 0.0
     agent_ms = 0
@@ -100,30 +130,45 @@ def _v1_read_usage(messages: Path) -> dict:
     unit = None
     last_turn_credits = 0.0
     last_turn_ms = 0
+    completed_turns = 0
+    open_turn_start_ms = None   # turn_start with no turn_end yet
+    last_event_ms = None
+    turn_open = None
 
     if not messages.is_file():
-        return {
-            "credits": 0.0, "agent_ms": 0, "turns": 0, "unit": None,
-            "last_turn_credits": 0.0, "last_turn_ms": 0,
-        }
+        return _v1_empty_usage()
 
     try:
         handle = messages.open(encoding="utf-8", errors="replace")
     except OSError:
-        return {
-            "credits": 0.0, "agent_ms": 0, "turns": 0, "unit": None,
-            "last_turn_credits": 0.0, "last_turn_ms": 0,
-        }
+        return _v1_empty_usage()
 
     with handle:
         for line in handle:
-            if "usage_summary" not in line:
+            if not any(m in line for m in _V1_MARKERS):
                 continue
             try:
-                payload = json.loads(line).get("payload") or {}
+                rec = json.loads(line)
+                payload = rec.get("payload") or {}
+                kind = payload.get("type")
             except (json.JSONDecodeError, TypeError, AttributeError):
                 continue
-            if payload.get("type") != "usage_summary":
+            if kind not in _V1_MARKERS:
+                continue
+
+            ts = rec.get("timestamp")
+            ts = _iso_to_ms(ts) if isinstance(ts, str) else None
+            if ts is not None:
+                last_event_ms = max(last_event_ms or 0, ts)
+
+            if kind == "turn_start":
+                turn_open = True
+                open_turn_start_ms = ts
+                continue
+            if kind == "turn_end":
+                turn_open = False
+                open_turn_start_ms = None
+                completed_turns += 1
                 continue
 
             turns += 1
@@ -141,30 +186,44 @@ def _v1_read_usage(messages: Path) -> dict:
     return {
         "credits": total,
         "agent_ms": agent_ms,
-        "turns": turns,
+        # turn_end count; falls back to the usage count for marker-less logs.
+        "turns": completed_turns or turns,
         "unit": unit,
         "last_turn_credits": last_turn_credits,
         "last_turn_ms": last_turn_ms,
+        "open_turn_start_ms": open_turn_start_ms,
+        "last_event_ms": last_event_ms,
+        "turn_open": turn_open,
     }
 
 
-def _v1_pick_session(root: Path, workspace_path: str | None):
+def _v1_pick_session(root: Path, workspace_path: str | None,
+                     session_id: str | None = None):
     """Choose the session to report on.
 
-    A live session (``in_progress``/``waiting_on_user``) wins, since that is by
-    definition the one invoking this tool. Ties break on the most recently
-    appended ``messages.jsonl``, which tracks real turn activity more closely
-    than ``session.json``.
+    A live session wins, since that is by definition the one invoking this
+    tool. Live means a status in ``LIVE_STATUSES`` *and* a ``messages.jsonl``
+    written within ``STALE_LIVE_MS``; abandoned windows leave sessions stuck
+    ``in_progress`` forever. Ties break on the most recently appended
+    ``messages.jsonl``, which tracks real turn activity more closely than
+    ``session.json``.
 
-    Auto-selection is best-effort: with several Kiro windows mid-turn at once,
-    more than one session is genuinely live and only ``workspace_path`` can
-    disambiguate them. Callers should check the ``session_id`` that comes back.
+    Auto-selection is best-effort: several windows mid-turn, or a chat running
+    workflow steps (separate sessions sharing its workspace), leave more than
+    one session genuinely live. The live candidates come back with their
+    ``agentMode`` so callers can retry with an exact ``session_id``.
+
+    Returns ``(session_dir, session_json, live_count, live_candidates)``.
     """
+    now = _now_ms()
     candidates = []
     for sess, meta in _v1_iter_session_dirs(root):
         try:
             data = json.loads(meta.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
+            continue
+
+        if session_id and session_id not in (data.get("id"), sess.name):
             continue
 
         if workspace_path:
@@ -179,50 +238,76 @@ def _v1_pick_session(root: Path, workspace_path: str | None):
         except OSError:
             continue
 
-        candidates.append((data.get("status") in LIVE_STATUSES, activity, sess, data))
+        live = (data.get("status") in LIVE_STATUSES
+                and (now - activity * 1000) < STALE_LIVE_MS)
+        candidates.append((live, activity, sess, data))
 
     if not candidates:
         return None
 
-    live_count = sum(1 for c in candidates if c[0])
     candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    live_candidates = [
+        {"session_id": data.get("id") or sess.name, "agent_mode": data.get("agentMode")}
+        for live, _, sess, data in candidates if live
+    ]
     _, _, sess, data = candidates[0]
-    return sess, data, live_count
+    return sess, data, len(live_candidates), live_candidates
 
 
-def read_v1(workspace_path: str | None = None) -> dict | None:
-    """Read session stats from the Kiro 1.0+ layout."""
+def read_v1(workspace_path: str | None = None,
+            session_id: str | None = None) -> dict | None:
+    """Read session stats from the Kiro 1.0+ layout.
+
+    ``session_id`` targets one session exactly (by ``session.json`` id or
+    directory name); ``workspace_path`` narrows the search to one workspace.
+    """
     root = v1_sessions_root()
     if not root.exists():
         return None
 
-    picked = _v1_pick_session(root, workspace_path)
+    picked = _v1_pick_session(root, workspace_path, session_id)
     if not picked:
         return None
-    sess, meta, live_count = picked
+    sess, meta, live_count, live_candidates = picked
 
     usage = _v1_read_usage(sess / "messages.jsonl")
     created = _iso_to_ms(meta.get("createdAt"))
     status = meta.get("status")
+    now = _now_ms()
+
+    open_start = usage["open_turn_start_ms"]
+    if usage["turn_open"] is not None:
+        # Turn markers are authoritative: an open turn_start means mid-turn.
+        turn_in_flight = usage["turn_open"]
+    else:
+        # Marker-less log: fall back to the session status.
+        turn_in_flight = status == "in_progress"
+    current_turn_ms = (max(now - open_start, 0)
+                       if turn_in_flight and open_start is not None else None)
 
     return {
         "source": "kiro-1.x",
         "session_id": meta.get("id"),
         "status": status,
         "model": meta.get("modelId"),
-        # >1 means several windows were mid-turn and the pick was a heuristic.
-        "ambiguous": live_count > 1 and not workspace_path,
+        "agent_mode": meta.get("agentMode"),
+        # >1 live session (several windows mid-turn, or a chat plus its
+        # workflow step sessions) means the pick was a heuristic.
+        "ambiguous": live_count > 1,
+        "candidates": live_candidates,
         "credits": usage["credits"],
         "last_turn_credits": usage["last_turn_credits"],
         "last_turn_ms": usage["last_turn_ms"],
         "turns": usage["turns"],
         "unit": usage["unit"] or "credits",
+        # Completed turns only; the in-flight turn is in current_turn_ms.
         "agent_ms": usage["agent_ms"],
-        "session_ms": (_now_ms() - created) if created else 0,
+        "current_turn_ms": current_turn_ms,
+        "session_ms": (now - created) if created else 0,
         "workspace_paths": meta.get("workspacePaths") or [],
-        # Mid-turn the extension holds metering in memory; the on-disk total
-        # only advances when the turn completes.
-        "turn_in_flight": status == "in_progress",
+        # Mid-turn the extension holds metering in memory; the on-disk credit
+        # total only advances when the turn completes.
+        "turn_in_flight": turn_in_flight,
     }
 
 
@@ -321,8 +406,11 @@ def _legacy_aggregate(chat_session_id: str, workspace: Path) -> dict:
     }
 
 
-def read_legacy() -> dict | None:
-    """Read session stats from the pre-1.0 execution-file layout."""
+def read_legacy(session_id: str | None = None) -> dict | None:
+    """Read session stats from the pre-1.0 execution-file layout.
+
+    With ``session_id``, returns None unless the running chat session matches.
+    """
     root = legacy_agent_storage()
     if not root.exists():
         return None
@@ -332,6 +420,8 @@ def read_legacy() -> dict | None:
         return None
 
     chat_id, ws = found
+    if session_id and chat_id != session_id:
+        return None
     agg = _legacy_aggregate(chat_id, ws)
 
     return {
@@ -339,7 +429,9 @@ def read_legacy() -> dict | None:
         "session_id": chat_id,
         "status": "running",
         "model": None,
+        "agent_mode": None,
         "ambiguous": False,
+        "candidates": [],
         "credits": agg["credits"],
         # Pre-1.0 metering was per model response, not per turn, so there is no
         # turn boundary to report.
@@ -348,6 +440,8 @@ def read_legacy() -> dict | None:
         "turns": agg["turns"],
         "unit": agg["unit"] or "credits",
         "agent_ms": agg["agent_ms"],
+        # agent_ms already includes the running execution's elapsed time.
+        "current_turn_ms": None,
         "session_ms": agg["session_ms"],
         "workspace_paths": [],
         "turn_in_flight": False,
@@ -361,7 +455,8 @@ def read_legacy() -> dict | None:
 READERS = {"v1": read_v1, "legacy": read_legacy}
 
 
-def read_stats(layout: str = "auto", workspace_path: str | None = None) -> dict | None:
+def read_stats(layout: str = "auto", workspace_path: str | None = None,
+               session_id: str | None = None) -> dict | None:
     """Read session stats, preferring the 1.0+ layout.
 
     ``layout`` accepts ``auto`` (default), ``v1``, or ``legacy``. Under ``auto``
@@ -370,10 +465,10 @@ def read_stats(layout: str = "auto", workspace_path: str | None = None) -> dict 
     never shadows live data.
     """
     if layout == "v1":
-        return read_v1(workspace_path)
+        return read_v1(workspace_path, session_id)
     if layout == "legacy":
-        return read_legacy()
+        return read_legacy(session_id)
     if layout != "auto":
         raise ValueError(f"unknown layout {layout!r}; expected auto, v1, or legacy")
 
-    return read_v1(workspace_path) or read_legacy()
+    return read_v1(workspace_path, session_id) or read_legacy(session_id)
