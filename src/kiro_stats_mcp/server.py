@@ -93,8 +93,8 @@ def _many_session_stats(layout: str, workspace_path: str | None,
                         session_ids: list[str]) -> dict:
     """Report each requested session plus a total across the ones found.
 
-    Totals sum the per-session figures as displayed (credits rounded to 4 dp,
-    agent time truncated to whole seconds), so they equal the sum of the rows.
+    Totals sum the raw on-disk credits and agent milliseconds, then round and
+    format once, so they can differ slightly from adding up the rounded rows.
     ``session_time`` is not totaled: each is time since that session was
     created, so step sessions overlap and keep growing after they finish.
     """
@@ -112,8 +112,8 @@ def _many_session_stats(layout: str, workspace_path: str | None,
             sessions.append({"session_id": sid, "error": "Session not found."})
             continue
         sessions.append(_format(data))
-        credits += round(data["credits"], 4)
-        agent_ms += (data["agent_ms"] // 1000) * 1000
+        credits += data["credits"]
+        agent_ms += data["agent_ms"]
         turns += data["turns"]
         if data["turn_in_flight"]:
             running.append(sid)

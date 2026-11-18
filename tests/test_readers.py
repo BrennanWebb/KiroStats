@@ -344,6 +344,82 @@ def test_v1_turns_counts_turn_end_without_usage(v1_root):
     assert got["agent_ms"] == 1500
 
 
+def _activity(kind, timestamp, execution_id):
+    return {"id": f"m-{kind}", "timestamp": timestamp,
+            "payload": {"type": kind, "executionId": execution_id}}
+
+
+def _write_v1_log(root, sess_id, records, *, status="idle"):
+    """Write a session whose messages.jsonl holds exactly ``records``."""
+    sess = _write_v1_session(root, "ws01", sess_id, status=status,
+                             created="2026-08-31T20:00:00.000Z", turns=[])
+    (sess / "messages.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    return sess
+
+
+def _split_turn(exec_id="exec-x", usage=1.0234, elapsed=14_915):
+    """One turn with Kiro's extra mid-turn `cancelled` turn_end (seen on 1.2.x)."""
+    return [
+        _turn_marker("turn_start", "2026-08-31T20:05:00.000Z", exec_id),
+        _turn_marker("turn_end", "2026-08-31T20:05:03.000Z", exec_id,
+                     stop_reason="cancelled"),
+        _activity("tool_call", "2026-08-31T20:05:04.000Z", exec_id),
+        _activity("assistant", "2026-08-31T20:05:10.000Z", exec_id),
+        _usage_record(usage, elapsed),
+        _turn_marker("turn_end", "2026-08-31T20:05:14.000Z", exec_id,
+                     stop_reason="end_turn"),
+    ]
+
+
+def test_v1_cancelled_turn_end_inside_turn_counts_once(v1_root):
+    _write_v1_log(v1_root, "sess_a", _split_turn())
+
+    got = readers.read_v1()
+    assert got["turns"] == 1
+    assert got["credits"] == pytest.approx(1.0234)
+    assert got["agent_ms"] == 14_915
+    assert got["turn_in_flight"] is False
+    assert got["current_turn_ms"] is None
+
+
+def test_v1_turn_still_running_after_cancelled_turn_end(v1_root, monkeypatch):
+    _write_v1_log(v1_root, "sess_a", [
+        _turn_marker("turn_start", "2026-08-31T20:01:00.000Z", "exec-y"),
+        _usage_record(0.5, 2_000),
+        _turn_marker("turn_end", "2026-08-31T20:01:02.000Z", "exec-y"),
+        *_split_turn()[:4],
+    ], status="in_progress")
+    monkeypatch.setattr(readers, "_now_ms", lambda: T0_MS + 300_000 + 42_000)
+
+    got = readers.read_v1()
+    assert got["turn_in_flight"] is True
+    # Measured from the turn's own turn_start, not the cancelled turn_end.
+    assert got["current_turn_ms"] == 42_000
+    assert got["turns"] == 1
+    assert got["credits"] == pytest.approx(0.5)
+
+
+def test_v1_real_cancel_with_trailing_records_is_closed(v1_root):
+    _write_v1_log(v1_root, "sess_a", _split_turn()[:3], status="idle")
+
+    got = readers.read_v1()
+    assert got["turn_in_flight"] is False
+    assert got["current_turn_ms"] is None
+    assert got["turns"] == 1
+
+
+def test_v1_real_cancel_then_new_turn_counts_both(v1_root):
+    _write_v1_log(v1_root, "sess_a", [
+        *_split_turn("exec-x")[:3],
+        *_split_turn("exec-y"),
+    ], status="in_progress")
+
+    got = readers.read_v1()
+    assert got["turns"] == 2
+    assert got["turn_in_flight"] is False
+
+
 def test_v1_stale_in_progress_does_not_win(v1_root):
     import os
     stale = _write_v1_session(v1_root, "ws01", "sess_stale", status="in_progress",
@@ -665,17 +741,31 @@ def test_tool_session_ids_flags_running_turn(v1_root, monkeypatch):
     assert "Turn still running in sess_run" in got["note"]
 
 
-def test_tool_session_ids_total_sums_displayed_values(v1_root):
+def test_tool_session_ids_total_sums_raw_values(v1_root):
     for sid in ("sess_a", "sess_b"):
         _write_v1_session(v1_root, "ws01", sid, status="idle",
                           created="2026-08-31T20:00:00.000Z",
                           turns=[(1.00004, 1_600)])
 
     got = get_session_stats(session_ids=["sess_a", "sess_b"])
+    # Per-session entries stay rounded as before.
     assert [s["credits_used"] for s in got["sessions"]] == [1.0, 1.0]
     assert [s["agent_time"] for s in got["sessions"]] == ["1s", "1s"]
-    assert got["total"]["credits_used"] == 2.0
-    assert got["total"]["agent_time"] == "2s"
+    # The total rounds the raw sums once: 2.00008 credits, 3,200 ms.
+    assert got["total"]["credits_used"] == 2.0001
+    assert got["total"]["agent_time"] == "3s"
+
+
+def test_tool_session_ids_counts_split_turn_once(v1_root):
+    _write_v1_log(v1_root, "sess_a", _split_turn("exec-a", 0.8389, 95_366))
+    _write_v1_log(v1_root, "sess_b", _split_turn("exec-b", 0.9029, 134_849))
+
+    got = get_session_stats(session_ids=["sess_a", "sess_b"])
+    assert [s["turns"] for s in got["sessions"]] == [1, 1]
+    assert [s["credits_used"] for s in got["sessions"]] == [0.8389, 0.9029]
+    assert got["total"]["turns"] == 2
+    assert got["total"]["credits_used"] == 1.7418
+    assert got["total"]["agent_time"] == "3m 50s"
 
 
 def test_tool_session_ids_rejects_bad_input(v1_root):

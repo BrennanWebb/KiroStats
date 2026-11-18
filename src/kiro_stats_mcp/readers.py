@@ -24,6 +24,12 @@ extension, so the current turn's credits are unknowable until it ends. Its
 elapsed time is not: an open ``turn_start`` gives the in-flight turn's start, so
 ``current_turn_ms`` is reported alongside the completed-turn totals.
 
+Kiro sometimes logs an extra ``turn_end`` with ``stopReason: "cancelled"``
+partway through a turn that then carries on under the same ``executionId``
+and ends with a normal ``turn_end``. Turns are therefore counted by distinct
+``executionId``, and a turn closed by ``cancelled`` is treated as running
+again when later records of that execution appear.
+
 Workflow steps (``agentMode`` such as ``wf-planner``) run as separate sessions
 that share the parent chat's ``workspacePaths``. Session selection therefore
 reports every live candidate with its ``agentMode`` and accepts an exact
@@ -111,6 +117,7 @@ def _v1_empty_usage() -> dict:
         "credits": 0.0, "agent_ms": 0, "turns": 0, "unit": None,
         "last_turn_credits": 0.0, "last_turn_ms": 0,
         "open_turn_start_ms": None, "last_event_ms": None, "turn_open": None,
+        "reopened": False,
     }
 
 
@@ -120,9 +127,14 @@ def _v1_read_usage(messages: Path) -> dict:
     Streams line by line and pre-filters on substrings so large logs stay
     cheap: only candidate lines are handed to the JSON parser.
 
-    ``turns`` counts ``turn_end`` records, falling back to the number of
-    ``usage_summary`` records for logs that carry no turn markers.
+    ``turns`` counts distinct ``executionId`` values across ``turn_end``
+    records, so an extra ``cancelled`` turn_end inside one turn is not
+    counted twice. It falls back to the number of ``usage_summary`` records
+    for logs that carry no turn markers.
     ``turn_open`` is True/False when turn markers were seen, else None.
+    ``reopened`` is True when the open turn was closed by a ``cancelled``
+    turn_end and later records of the same execution showed it carrying on;
+    that turn is still included in ``turns``.
     """
     total = 0.0
     agent_ms = 0
@@ -130,10 +142,16 @@ def _v1_read_usage(messages: Path) -> dict:
     unit = None
     last_turn_credits = 0.0
     last_turn_ms = 0
-    completed_turns = 0
+    ended_execs = set()
+    unkeyed_ends = 0            # turn_end records without an executionId
     open_turn_start_ms = None   # turn_start with no turn_end yet
     last_event_ms = None
     turn_open = None
+    reopened = False
+    start_exec = None           # executionId and start of the latest turn_start
+    start_ms = None
+    cancelled_exec = None       # execution last closed by a cancelled turn_end
+    cancelled_start_ms = None
 
     if not messages.is_file():
         return _v1_empty_usage()
@@ -145,15 +163,24 @@ def _v1_read_usage(messages: Path) -> dict:
 
     with handle:
         for line in handle:
-            if not any(m in line for m in _V1_MARKERS):
+            # After a cancelled turn_end, lines naming that execution are
+            # parsed too: they show the turn is still going.
+            resumes = cancelled_exec is not None and cancelled_exec in line
+            if not resumes and not any(m in line for m in _V1_MARKERS):
                 continue
             try:
                 rec = json.loads(line)
                 payload = rec.get("payload") or {}
                 kind = payload.get("type")
+                exec_id = payload.get("executionId")
             except (json.JSONDecodeError, TypeError, AttributeError):
                 continue
             if kind not in _V1_MARKERS:
+                if resumes and exec_id == cancelled_exec:
+                    turn_open = True
+                    reopened = True
+                    open_turn_start_ms = cancelled_start_ms
+                    cancelled_exec = None
                 continue
 
             ts = rec.get("timestamp")
@@ -163,12 +190,24 @@ def _v1_read_usage(messages: Path) -> dict:
 
             if kind == "turn_start":
                 turn_open = True
+                reopened = False
                 open_turn_start_ms = ts
+                start_exec, start_ms = exec_id, ts
+                cancelled_exec = None
                 continue
             if kind == "turn_end":
                 turn_open = False
+                reopened = False
                 open_turn_start_ms = None
-                completed_turns += 1
+                if exec_id:
+                    ended_execs.add(exec_id)
+                else:
+                    unkeyed_ends += 1
+                if exec_id and payload.get("stopReason") == "cancelled":
+                    cancelled_exec = exec_id
+                    cancelled_start_ms = start_ms if exec_id == start_exec else None
+                else:
+                    cancelled_exec = None
                 continue
 
             turns += 1
@@ -186,14 +225,16 @@ def _v1_read_usage(messages: Path) -> dict:
     return {
         "credits": total,
         "agent_ms": agent_ms,
-        # turn_end count; falls back to the usage count for marker-less logs.
-        "turns": completed_turns or turns,
+        # Turns that logged a turn_end, one per execution; falls back to the
+        # usage count for marker-less logs.
+        "turns": (len(ended_execs) + unkeyed_ends) or turns,
         "unit": unit,
         "last_turn_credits": last_turn_credits,
         "last_turn_ms": last_turn_ms,
         "open_turn_start_ms": open_turn_start_ms,
         "last_event_ms": last_event_ms,
         "turn_open": turn_open,
+        "reopened": reopened,
     }
 
 
@@ -282,6 +323,14 @@ def read_v1(workspace_path: str | None = None,
     else:
         # Marker-less log: fall back to the session status.
         turn_in_flight = status == "in_progress"
+    turns = usage["turns"]
+    if usage["reopened"]:
+        # Activity after a cancelled turn_end. A real cancellation can leave
+        # trailing records too, so a live status must confirm it is running.
+        turn_in_flight = status == "in_progress"
+        if turn_in_flight:
+            # Its cancelled turn_end was counted; the turn has not completed.
+            turns -= 1
     current_turn_ms = (max(now - open_start, 0)
                        if turn_in_flight and open_start is not None else None)
 
@@ -298,7 +347,7 @@ def read_v1(workspace_path: str | None = None,
         "credits": usage["credits"],
         "last_turn_credits": usage["last_turn_credits"],
         "last_turn_ms": usage["last_turn_ms"],
-        "turns": usage["turns"],
+        "turns": turns,
         "unit": usage["unit"] or "credits",
         # Completed turns only; the in-flight turn is in current_turn_ms.
         "agent_ms": usage["agent_ms"],

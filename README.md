@@ -75,9 +75,10 @@ them all as `session_ids`:
 ```
 
 Each `sessions` entry is exactly what a single `session_id` call returns, in
-the order given; duplicate ids are dropped. `total` sums the per-session figures
-as shown (credits to 4 dp, agent time in whole seconds), so it equals adding
-up the rows. Unknown ids get an `error` entry and
+the order given; duplicate ids are dropped. `total` sums the raw on-disk
+credits and agent milliseconds, then rounds once (credits to 4 dp, agent time
+to whole seconds), so it can differ slightly from adding up the rounded rows.
+Unknown ids get an `error` entry and
 are left out of `total`. A session with a turn still running is counted with
 its completed turns only, and `note` names it. `session_time` is not totaled:
 it is time since each session was created, so step sessions overlap and keep
@@ -118,12 +119,14 @@ That record is what the chat footer renders: `18.5044` and `387160 ms` display a
 `Est. Credits Used: 18.5 / Elapsed time: 6m 27s`.
 
 Each turn is bracketed by `turn_start` and `turn_end` records. KiroStats counts
-`turns` by `turn_end` (so aborted, unmetered turns still count) and uses an open
-`turn_start` to report `current_turn_time` for the turn in progress. Workflow
-step sessions sometimes log an extra `turn_end` with `stopReason: "cancelled"`
-a few seconds into a turn that then carries on under the same `executionId`,
-so such a step reports one more turn than it ran. Credits and time are
-unaffected.
+`turns` by distinct `executionId` across `turn_end` records (so aborted,
+unmetered turns still count) and uses an open `turn_start` to report
+`current_turn_time` for the turn in progress. Kiro sometimes logs an extra
+`turn_end` with `stopReason: "cancelled"` partway through a turn that then
+carries on under the same `executionId` and ends with a normal `turn_end`.
+That turn counts once, and when later records of the same execution follow
+the `cancelled` one in a session still `in_progress`, the turn is reported as
+running.
 
 Workflow steps (`agentMode` such as `wf-planner`) run as their own sessions and
 share the parent chat's `workspacePaths`.
