@@ -35,7 +35,11 @@ that share the parent chat's ``workspacePaths``. Session selection therefore
 reports every live candidate with its ``agentMode`` and accepts an exact
 ``session_id``. A session counts as live only when its status says so *and* its
 log was written recently, so abandoned ``in_progress`` sessions cannot shadow
-the real one.
+the real one. A step's ``session.json`` names its run and step under
+``_meta.kiro.workflow`` (``workflowId``, ``nodeId``, ``nodePath``), which is how
+a workflow run's step sessions are found. ``modelId`` and ``effortLevel`` there
+are the session's current setting; the model can change mid-session, but step
+sessions are short and run on one model in practice.
 """
 
 import json
@@ -57,6 +61,52 @@ STALE_LIVE_MS = 30 * 60 * 1000
 _V1_MARKERS = ("usage_summary", "turn_start", "turn_end")
 
 _HEX32 = re.compile(r"^[a-f0-9]{32}$")
+
+LAYOUTS = ("auto", "v1", "legacy")
+
+# Every reader returns exactly these keys. A reader sets only what its layout
+# records; the rest keep these defaults. None means "not recorded", and the
+# tool leaves such fields out of its output.
+_RESULT_DEFAULTS = {
+    "source": None,
+    "session_id": None,
+    "status": None,
+    "model": None,
+    "effort_level": None,
+    "agent_mode": None,
+    # Workflow step name (nodeId), and its full path when that adds anything,
+    # e.g. "build-loop/iter-1/code" for a repeat-loop iteration.
+    "step": None,
+    "step_path": None,
+    "ambiguous": False,
+    "candidates": (),
+    "credits": 0.0,
+    "last_turn_credits": None,
+    "last_turn_ms": None,
+    "turns": 0,
+    "unit": "credits",
+    "agent_ms": 0,
+    "current_turn_ms": None,
+    "session_ms": 0,
+    "workspace_paths": (),
+    "turn_in_flight": False,
+}
+
+
+def _result(**fields) -> dict:
+    """Build a reader result from ``_RESULT_DEFAULTS`` plus ``fields``."""
+    unknown = fields.keys() - _RESULT_DEFAULTS.keys()
+    if unknown:
+        raise KeyError(f"unknown reader result keys: {sorted(unknown)}")
+    result = dict(_RESULT_DEFAULTS, **fields)
+    result["candidates"] = list(result["candidates"])
+    result["workspace_paths"] = list(result["workspace_paths"])
+    return result
+
+
+def _check_layout(layout: str) -> None:
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown layout {layout!r}; expected auto, v1, or legacy")
 
 
 def _now_ms() -> int:
@@ -238,6 +288,67 @@ def _v1_read_usage(messages: Path) -> dict:
     }
 
 
+def _v1_in_workspace(data: dict, workspace_path: str) -> bool:
+    target = _norm(workspace_path)
+    return target in [_norm(p) for p in (data.get("workspacePaths") or [])]
+
+
+def _v1_workflow_meta(data: dict) -> dict:
+    """``_meta.kiro.workflow`` of a step session, or {} for any other session."""
+    meta = data.get("_meta")
+    kiro = meta.get("kiro") if isinstance(meta, dict) else None
+    workflow = kiro.get("workflow") if isinstance(kiro, dict) else None
+    return workflow if isinstance(workflow, dict) else {}
+
+
+def _v1_step_path(workflow: dict) -> str | None:
+    """The step's ``nodePath`` below the run, when it says more than ``nodeId``.
+
+    Repeat-loop iterations and parallel branches share a ``nodeId`` (``code``
+    twice) but not a path (``build-loop/iter-0/code``, ``build-loop/iter-1/code``).
+    """
+    path = workflow.get("nodePath")
+    if not isinstance(path, list) or not path:
+        return None
+    if path[0] == workflow.get("workflowId"):
+        path = path[1:]
+    joined = "/".join(str(p) for p in path)
+    return joined if joined and joined != workflow.get("nodeId") else None
+
+
+def v1_workflow_session_ids(workflow_id: str,
+                            workspace_path: str | None = None) -> list[str]:
+    """Ids of every step session of one workflow run, oldest first.
+
+    Matches ``session.json`` ``_meta.kiro.workflow.workflowId``. The chat that
+    launched the run has no workflow block, so it is not included. Steps are
+    ordered by ``createdAt``, which is the order they ran in.
+    """
+    root = v1_sessions_root()
+    if not root.exists():
+        return []
+
+    found = []
+    for sess, meta in _v1_iter_session_dirs(root):
+        try:
+            text = meta.read_text(encoding="utf-8")
+            # Cheap pre-filter: most sessions do not name this run at all.
+            if workflow_id not in text:
+                continue
+            data = json.loads(text)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if _v1_workflow_meta(data).get("workflowId") != workflow_id:
+            continue
+        if workspace_path and not _v1_in_workspace(data, workspace_path):
+            continue
+        sid = data.get("id") or sess.name
+        found.append((_iso_to_ms(data.get("createdAt")) or 0, sid))
+
+    found.sort()
+    return [sid for _, sid in found]
+
+
 def _v1_pick_session(root: Path, workspace_path: str | None,
                      session_id: str | None = None):
     """Choose the session to report on.
@@ -267,11 +378,8 @@ def _v1_pick_session(root: Path, workspace_path: str | None,
         if session_id and session_id not in (data.get("id"), sess.name):
             continue
 
-        if workspace_path:
-            target = _norm(workspace_path)
-            paths = [_norm(p) for p in (data.get("workspacePaths") or [])]
-            if target not in paths:
-                continue
+        if workspace_path and not _v1_in_workspace(data, workspace_path):
+            continue
 
         messages = sess / "messages.jsonl"
         try:
@@ -334,30 +442,37 @@ def read_v1(workspace_path: str | None = None,
     current_turn_ms = (max(now - open_start, 0)
                        if turn_in_flight and open_start is not None else None)
 
-    return {
-        "source": "kiro-1.x",
-        "session_id": meta.get("id"),
-        "status": status,
-        "model": meta.get("modelId"),
-        "agent_mode": meta.get("agentMode"),
+    workflow = _v1_workflow_meta(meta)
+
+    return _result(
+        source="kiro-1.x",
+        session_id=meta.get("id"),
+        status=status,
+        # The session's current setting; "auto" stays "auto", since the model
+        # the server picked is not recorded.
+        model=meta.get("modelId") or None,
+        effort_level=meta.get("effortLevel") or None,
+        agent_mode=meta.get("agentMode") or None,
+        step=workflow.get("nodeId") or None,
+        step_path=_v1_step_path(workflow),
         # >1 live session (several windows mid-turn, or a chat plus its
         # workflow step sessions) means the pick was a heuristic.
-        "ambiguous": live_count > 1,
-        "candidates": live_candidates,
-        "credits": usage["credits"],
-        "last_turn_credits": usage["last_turn_credits"],
-        "last_turn_ms": usage["last_turn_ms"],
-        "turns": turns,
-        "unit": usage["unit"] or "credits",
+        ambiguous=live_count > 1,
+        candidates=live_candidates,
+        credits=usage["credits"],
+        last_turn_credits=usage["last_turn_credits"],
+        last_turn_ms=usage["last_turn_ms"],
+        turns=turns,
+        unit=usage["unit"] or "credits",
         # Completed turns only; the in-flight turn is in current_turn_ms.
-        "agent_ms": usage["agent_ms"],
-        "current_turn_ms": current_turn_ms,
-        "session_ms": (now - created) if created else 0,
-        "workspace_paths": meta.get("workspacePaths") or [],
+        agent_ms=usage["agent_ms"],
+        current_turn_ms=current_turn_ms,
+        session_ms=(now - created) if created else 0,
+        workspace_paths=meta.get("workspacePaths") or [],
         # Mid-turn the extension holds metering in memory; the on-disk credit
         # total only advances when the turn completes.
-        "turn_in_flight": turn_in_flight,
-    }
+        turn_in_flight=turn_in_flight,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -473,28 +588,21 @@ def read_legacy(session_id: str | None = None) -> dict | None:
         return None
     agg = _legacy_aggregate(chat_id, ws)
 
-    return {
-        "source": "kiro-0.x",
-        "session_id": chat_id,
-        "status": "running",
-        "model": None,
-        "agent_mode": None,
-        "ambiguous": False,
-        "candidates": [],
-        "credits": agg["credits"],
-        # Pre-1.0 metering was per model response, not per turn, so there is no
-        # turn boundary to report.
-        "last_turn_credits": None,
-        "last_turn_ms": None,
-        "turns": agg["turns"],
-        "unit": agg["unit"] or "credits",
-        "agent_ms": agg["agent_ms"],
-        # agent_ms already includes the running execution's elapsed time.
-        "current_turn_ms": None,
-        "session_ms": agg["session_ms"],
-        "workspace_paths": [],
-        "turn_in_flight": False,
-    }
+    # Left at their defaults: model and effort (recorded only patchily, on
+    # reasoning entries), agent mode and workflow step (not recorded),
+    # per-turn figures (metering was per model response, so there is no turn
+    # boundary), current_turn_ms (agent_ms already includes the running
+    # execution's elapsed time) and workspace paths.
+    return _result(
+        source="kiro-0.x",
+        session_id=chat_id,
+        status="running",
+        credits=agg["credits"],
+        turns=agg["turns"],
+        unit=agg["unit"] or "credits",
+        agent_ms=agg["agent_ms"],
+        session_ms=agg["session_ms"],
+    )
 
 
 # --------------------------------------------------------------------------
@@ -513,11 +621,22 @@ def read_stats(layout: str = "auto", workspace_path: str | None = None,
     yields nothing, so a stale globalStorage tree left behind by an upgrade
     never shadows live data.
     """
+    _check_layout(layout)
     if layout == "v1":
         return read_v1(workspace_path, session_id)
     if layout == "legacy":
         return read_legacy(session_id)
-    if layout != "auto":
-        raise ValueError(f"unknown layout {layout!r}; expected auto, v1, or legacy")
 
     return read_v1(workspace_path, session_id) or read_legacy(session_id)
+
+
+def workflow_session_ids(workflow_id: str, layout: str = "auto",
+                         workspace_path: str | None = None) -> list[str]:
+    """Step session ids of a workflow run, oldest first.
+
+    Only the 1.0+ layout records workflows, so ``legacy`` finds none.
+    """
+    _check_layout(layout)
+    if layout == "legacy":
+        return []
+    return v1_workflow_session_ids(workflow_id, workspace_path)

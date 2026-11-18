@@ -42,25 +42,37 @@ def _turn_marker(kind, timestamp, execution_id="exec", stop_reason="end_turn"):
 
 def _write_v1_session(root, ws_key, sess_id, *, status, created, turns,
                       workspace_paths=None, model="claude-opus-5",
-                      agent_mode="vibe", markers=False, open_turn_at=None):
+                      agent_mode="vibe", markers=False, open_turn_at=None,
+                      effort=None, workflow=None, root_conversation=None):
     """Write a session dir.
 
     ``turns`` is a list of ``(usage, elapsed_ms)``; ``usage=None`` writes a turn
     with no usage_summary (aborted/unmetered). ``markers`` brackets each turn
     with turn_start/turn_end. ``open_turn_at`` appends a trailing turn_start at
-    that ISO timestamp with no turn_end.
+    that ISO timestamp with no turn_end. ``model``/``effort`` of None leave
+    ``modelId``/``effortLevel`` out. ``workflow`` is written as
+    ``_meta.kiro.workflow``, as on a workflow step session.
     """
     sess = root / ws_key / sess_id
     sess.mkdir(parents=True)
-    (sess / "session.json").write_text(json.dumps({
+    data = {
         "schemaVersion": "1.0.0",
         "id": sess_id,
         "status": status,
         "createdAt": created,
-        "modelId": model,
         "agentMode": agent_mode,
         "workspacePaths": workspace_paths or [],
-    }), encoding="utf-8")
+    }
+    if model is not None:
+        data["modelId"] = model
+    if effort is not None:
+        data["effortLevel"] = effort
+    if root_conversation is not None:
+        data["rootConversationId"] = root_conversation
+    if workflow is not None:
+        data["_meta"] = {"kiro": {"workflow": workflow, "modelId": model,
+                                  "effortLevel": effort}}
+    (sess / "session.json").write_text(json.dumps(data), encoding="utf-8")
 
     lines = []
     for i, (usage, elapsed) in enumerate(turns):
@@ -692,6 +704,9 @@ def test_tool_session_ids_array(v1_root):
         "agent_time": "2m 1s",
         "turns": 3,
         "sessions_counted": 2,
+        "by_model": {
+            "claude-opus-5": {"credits_used": 2.4617, "turns": 3, "sessions": 2},
+        },
     }
     assert "note" not in got
 
@@ -777,6 +792,267 @@ def test_tool_session_ids_rejects_bad_input(v1_root):
     assert "no session ids" in get_session_stats(session_ids=[])["error"]
     assert "unknown layout" in get_session_stats(
         layout="nope", session_ids=["sess_one"])["error"]
+
+
+# --------------------------------------------------------------------------
+# model, effort, agent mode and workflow step
+# --------------------------------------------------------------------------
+
+WF = "wf_0123456789abcdef"
+REPO = r"c:\repos\KiroStats"
+
+
+def _step(node_id, *loop, workflow_id=WF, iteration=None):
+    """``_meta.kiro.workflow`` as Kiro writes it for a step session."""
+    meta = {"workflowId": workflow_id, "workflowName": "demo",
+            "nodeId": node_id, "nodePath": [workflow_id, *loop, node_id],
+            "type": "step"}
+    if iteration is not None:
+        meta["iteration"] = iteration
+    return meta
+
+
+def test_v1_reports_model_effort_mode_and_step(v1_root):
+    _write_v1_session(v1_root, "ws01", "sess_a", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                      model="claude-opus-5.5", effort="low", agent_mode="wf-coder",
+                      workflow=_step("setup"))
+
+    got = readers.read_v1()
+    assert got["model"] == "claude-opus-5.5"
+    assert got["effort_level"] == "low"
+    assert got["agent_mode"] == "wf-coder"
+    assert got["step"] == "setup"
+    assert got["step_path"] is None
+
+
+def test_tool_shows_model_effort_and_agent_mode(v1_root):
+    _write_v1_session(v1_root, "ws01", "sess_a", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                      model="claude-opus-5.5", effort="high")
+
+    got = get_session_stats()
+    assert got["model"] == "claude-opus-5.5"
+    assert got["effort_level"] == "high"
+    assert got["agent_mode"] == "vibe"
+    # A chat that is not a workflow step has no step fields.
+    assert "step" not in got
+    assert "step_path" not in got
+    # Existing figures are unchanged.
+    assert got["credits_used"] == 1.0
+    assert got["turns"] == 1
+
+
+def test_tool_reports_auto_and_leaves_out_unrecorded_fields(v1_root):
+    _write_v1_session(v1_root, "ws01", "sess_auto", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                      model="auto")
+    _write_v1_session(v1_root, "ws01", "sess_bare", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                      model=None, agent_mode=None)
+
+    auto = get_session_stats(session_id="sess_auto")
+    assert auto["model"] == "auto"
+    assert "effort_level" not in auto
+    bare = get_session_stats(session_id="sess_bare")
+    for key in ("model", "effort_level", "agent_mode", "step", "step_path"):
+        assert key not in bare
+
+
+def test_tool_omits_model_and_step_fields_on_legacy(v1_root, legacy_root):
+    _write_legacy_execution(legacy_root, H32_A, H32_B, H32_C,
+                            chat_id="chat-1", status="running",
+                            start=1_000_000, end=1_001_000, usages=[1.0])
+
+    got = get_session_stats()
+    assert got["source"] == "kiro-0.x"
+    for key in ("model", "effort_level", "agent_mode", "step", "step_path"):
+        assert key not in got
+
+
+def test_readers_return_the_same_keys(v1_root, legacy_root):
+    _write_v1_session(v1_root, "ws01", "sess_a", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)])
+    _write_legacy_execution(legacy_root, H32_A, H32_B, H32_C,
+                            chat_id="chat-1", status="running",
+                            start=1_000_000, end=None, usages=[1.0])
+
+    keys = set(readers._RESULT_DEFAULTS)
+    assert set(readers.read_v1()) == keys
+    assert set(readers.read_legacy()) == keys
+
+
+def test_result_rejects_unknown_keys():
+    with pytest.raises(KeyError, match="credit"):
+        readers._result(credit=1.0)
+    # Mutable defaults are fresh per result.
+    one = readers._result()
+    one["candidates"].append("x")
+    assert readers._result()["candidates"] == []
+
+
+def test_tool_step_path_tells_loop_iterations_apart(v1_root):
+    _write_v1_session(v1_root, "ws01", "sess_c0", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                      agent_mode="wf-coder",
+                      workflow=_step("code", "build-loop", "iter-0", iteration=0))
+    _write_v1_session(v1_root, "ws01", "sess_c1", status="idle",
+                      created="2026-08-31T20:00:00.000Z", turns=[(1.0, 100)],
+                      agent_mode="wf-coder",
+                      workflow=_step("code", "build-loop", "iter-1", iteration=1))
+
+    c0 = get_session_stats(session_id="sess_c0")
+    c1 = get_session_stats(session_id="sess_c1")
+    assert (c0["step"], c0["step_path"]) == ("code", "build-loop/iter-0/code")
+    assert (c1["step"], c1["step_path"]) == ("code", "build-loop/iter-1/code")
+    assert c0["agent_mode"] == "wf-coder"
+
+
+def test_tool_session_ids_total_by_model(v1_root):
+    _write_v1_session(v1_root, "ws01", "sess_a", status="idle",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(1.00004, 1_000), (2.0, 1_000)], model="claude-opus-5.5")
+    _write_v1_session(v1_root, "ws01", "sess_b", status="idle",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(0.5, 1_000)], model="claude-haiku-4.5")
+    _write_v1_session(v1_root, "ws01", "sess_c", status="idle",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(1.00004, 1_000)], model="claude-opus-5.5")
+    _write_v1_session(v1_root, "ws01", "sess_d", status="idle",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(0.25, 1_000)], model=None)
+
+    got = get_session_stats(session_ids="sess_a, sess_b, sess_c, sess_d, sess_nope")
+    by_model = got["total"]["by_model"]
+    assert list(by_model) == ["claude-opus-5.5", "claude-haiku-4.5", "unknown"]
+    # Raw sums rounded once, as for the total.
+    assert by_model["claude-opus-5.5"] == {"credits_used": 4.0001, "turns": 3, "sessions": 2}
+    assert by_model["claude-haiku-4.5"] == {"credits_used": 0.5, "turns": 1, "sessions": 1}
+    assert by_model["unknown"] == {"credits_used": 0.25, "turns": 1, "sessions": 1}
+    assert got["total"]["credits_used"] == 4.7501
+    assert got["total"]["sessions_counted"] == 4
+
+
+def test_tool_session_ids_by_model_empty_when_none_found(v1_root):
+    got = get_session_stats(session_ids="sess_nope")
+    assert got["total"]["by_model"] == {}
+    assert got["total"]["sessions_counted"] == 0
+
+
+def _write_workflow_run(v1_root):
+    """A main chat, its five step sessions, and a step of another run.
+
+    Directory names sort differently from createdAt to prove the ordering.
+    """
+    _write_v1_session(v1_root, "ws01", "sess_main", status="in_progress",
+                      created="2026-08-31T19:59:00.000Z", turns=[(9.0, 9_000)],
+                      workspace_paths=[REPO], model="claude-opus-5.5", effort="high")
+    steps = [
+        ("sess_e", "20:00:00", _step("create-workflow"), "wf-workflow-creator", "high", (1.0, 1_000)),
+        ("sess_d", "20:01:00", _step("setup"), "wf-coder", "low", (0.5, 2_000)),
+        ("sess_c", "20:02:00", _step("code", "build-loop", "iter-0", iteration=0), "wf-coder", "high", (3.0, 3_000)),
+        ("sess_b", "20:03:00", _step("review", "build-loop", "iter-0", iteration=0), "wf-code-reviewer", "high", (2.0, 4_000)),
+        ("sess_a", "20:04:00", _step("code", "build-loop", "iter-1", iteration=1), "wf-coder", "medium", (1.5, 5_000)),
+    ]
+    for sid, at, workflow, mode, effort, turn in steps:
+        _write_v1_session(v1_root, "ws01", sid, status="idle",
+                          created=f"2026-08-31T{at}.000Z", turns=[turn],
+                          workspace_paths=[REPO], model="claude-opus-5.5",
+                          effort=effort, agent_mode=mode, workflow=workflow,
+                          root_conversation="sess_main", markers=True)
+    _write_v1_session(v1_root, "ws01", "sess_other", status="idle",
+                      created="2026-08-31T20:00:30.000Z", turns=[(7.0, 7_000)],
+                      workspace_paths=[REPO], agent_mode="wf-coder",
+                      workflow=_step("plan", workflow_id="wf_ffffffffffffffff"),
+                      root_conversation="sess_main")
+    # A chat whose title names the run must not match on text alone.
+    meta = v1_root / "ws01" / "sess_main" / "session.json"
+    data = json.loads(meta.read_text(encoding="utf-8"))
+    data["title"] = f"launch {WF}"
+    meta.write_text(json.dumps(data), encoding="utf-8")
+    return [s[0] for s in steps]
+
+
+def test_v1_workflow_session_ids_in_run_order(v1_root):
+    expected = _write_workflow_run(v1_root)
+
+    assert readers.v1_workflow_session_ids(WF) == expected
+    assert readers.workflow_session_ids(WF) == expected
+    assert readers.workflow_session_ids(WF, "legacy") == []
+    with pytest.raises(ValueError, match="unknown layout"):
+        readers.workflow_session_ids(WF, "nope")
+
+
+def test_tool_workflow_id_matches_session_ids(v1_root):
+    expected = _write_workflow_run(v1_root)
+
+    got = get_session_stats(workspace_path=REPO, workflow_id=WF)
+    assert [s["session_id"] for s in got["sessions"]] == expected
+    # Same output as passing the step ids by hand; the main chat is left out.
+    assert got == get_session_stats(workspace_path=REPO, session_ids=expected)
+    assert [(s["step"], s.get("step_path")) for s in got["sessions"]] == [
+        ("create-workflow", None), ("setup", None),
+        ("code", "build-loop/iter-0/code"), ("review", "build-loop/iter-0/review"),
+        ("code", "build-loop/iter-1/code"),
+    ]
+    assert [s["effort_level"] for s in got["sessions"]] == [
+        "high", "low", "high", "high", "medium"]
+    assert got["sessions"][2]["agent_mode"] == "wf-coder"
+    assert got["total"] == {
+        "credits_used": 8.0,
+        "agent_time": "15s",
+        "turns": 5,
+        "sessions_counted": 5,
+        "by_model": {"claude-opus-5.5": {"credits_used": 8.0, "turns": 5, "sessions": 5}},
+    }
+
+
+def test_tool_workflow_id_strips_whitespace_and_filters_workspace(v1_root):
+    expected = _write_workflow_run(v1_root)
+
+    got = get_session_stats(workflow_id=f"  {WF}\n")
+    assert [s["session_id"] for s in got["sessions"]] == expected
+    assert get_session_stats(workspace_path=r"c:\elsewhere", workflow_id=WF) == {
+        "error": f"No step sessions found for workflow {WF}."}
+
+
+def test_tool_workflow_id_unknown_run(v1_root):
+    _write_workflow_run(v1_root)
+
+    assert get_session_stats(workflow_id="wf_nope") == {
+        "error": "No step sessions found for workflow wf_nope."}
+
+
+def test_tool_workflow_id_rejects_bad_input(v1_root):
+    _write_workflow_run(v1_root)
+
+    alone = "Pass workflow_id alone, not with session_id or session_ids."
+    assert get_session_stats(workflow_id=WF, session_id="sess_a") == {"error": alone}
+    assert get_session_stats(workflow_id=WF, session_ids=["sess_a"]) == {"error": alone}
+    assert get_session_stats(workflow_id=" ") == {"error": "workflow_id is empty."}
+    assert "unknown layout" in get_session_stats(layout="nope", workflow_id=WF)["error"]
+    # Pre-1.0 did not record workflows.
+    assert "No step sessions" in get_session_stats(layout="legacy", workflow_id=WF)["error"]
+
+
+# --------------------------------------------------------------------------
+# installer
+# --------------------------------------------------------------------------
+
+def test_installer_copies_repo_steering_file():
+    """install.ps1 writes the repo's stats.md rather than an embedded copy."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    script = (repo / "install.ps1").read_text(encoding="utf-8")
+    steering = (repo / ".kiro" / "steering" / "stats.md").read_bytes()
+
+    assert r'".kiro\steering\stats.md"' in script
+    assert "TrimStart([char]0xFEFF)" in script
+    assert "inclusion: manual" not in script
+    # The source must carry no BOM and open with front matter.
+    assert steering.startswith(b"---")
+    assert b"workflow_id" in steering
 
 
 @pytest.mark.parametrize("ms,expected", [

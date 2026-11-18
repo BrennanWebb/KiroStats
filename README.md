@@ -17,6 +17,9 @@ Type `/stats` in any Kiro chat.
   "turns": 4,
   "source": "kiro-1.x",
   "session_id": "sess_ec3ae179-3b53-4ee1-a6be-95c67922ebeb",
+  "model": "claude-opus-5.5",
+  "effort_level": "high",
+  "agent_mode": "vibe",
   "last_turn_credits": 7.2263,
   "last_turn_time": "1m 29s",
   "current_turn_time": "42s",
@@ -33,15 +36,15 @@ cd KiroStats
 ```
 
 The installer locates a Python 3.10+ interpreter, pip-installs the package,
-registers the server in `~/.kiro/settings/mcp.json`, and writes a `/stats`
-steering file.
+registers the server in `~/.kiro/settings/mcp.json`, and copies the repo's
+`.kiro/steering/stats.md` to `~/.kiro/steering/` as the `/stats` steering file.
 
 Kiro normally picks up the new server on its own. Restart it if `/stats` does not
 respond.
 
 ## Tool
 
-`get_session_stats(layout="auto", workspace_path=None, session_id=None, session_ids=None)`
+`get_session_stats(layout="auto", workspace_path=None, session_id=None, session_ids=None, workflow_id=None)`
 
 | Arg | Purpose |
 |-----|---------|
@@ -49,19 +52,62 @@ respond.
 | `workspace_path` | A workspace root path. Narrows the search to that workspace. 1.0+ only. |
 | `session_id` | An exact session id, e.g. from an earlier response or the ambiguity note. |
 | `session_ids` | Several exact session ids, as a list or one string (`"id1, id2, id3"`). Cannot be combined with `session_id`. |
+| `workflow_id` | A workflow run id (`wf_...`). Reports every step session of that run. 1.0+ only. Cannot be combined with `session_id` or `session_ids`. |
 
 Returns `credits_used` (session total), `agent_time` (completed turns),
 `session_time`, `turns`, `source`, and `session_id`, plus `last_turn_credits` /
 `last_turn_time` on 1.0+. `current_turn_time` appears while a turn is running.
 A `note` field appears when a caveat applies.
 
+On 1.0+ each result also carries what `session.json` records about the session,
+and leaves out any field it does not record:
+
+| Field | From `session.json` | Example |
+|-------|---------------------|---------|
+| `model` | `modelId` | `claude-opus-5.5`, or `auto` (the model auto picked is not recorded) |
+| `effort_level` | `effortLevel` | `low`, `medium`, `high`, `xhigh`; often absent |
+| `agent_mode` | `agentMode` | `vibe`, `wf-coder`, `wf-planner` |
+| `step` | `_meta.kiro.workflow.nodeId` | `plan`, `code`; workflow steps only |
+| `step_path` | `_meta.kiro.workflow.nodePath`, below the run id | `build-loop/iter-1/code`; only when it differs from `step` |
+
+`model` and `effort_level` are the session's current setting. A chat that
+switched model mid-session reports only its latest one; workflow step sessions
+run on one model. Pre-1.0 leaves all five out.
+
 ### Workflows
 
 Each workflow step runs as its own session, and a turn's credits are written
 only when that turn ends. Gather stats from the orchestrating chat after the
-steps finish: `inspect_workflow` lists every step's `session: sess_...`,
-including the workflow-creator step and steps that never send a message. Pass
-them all as `session_ids`:
+steps finish. Pass the run id as `workflow_id`:
+
+```json
+{
+  "sessions": [
+    {"session_id": "sess_67fecbbc-...", "credits_used": 0.7382, "agent_time": "13s",
+     "model": "claude-opus-5.5", "effort_level": "low", "agent_mode": "wf-coder",
+     "step": "setup", "...": "..."},
+    {"session_id": "sess_82863f0c-...", "credits_used": 15.0727, "agent_time": "9m 8s",
+     "model": "claude-opus-5.5", "effort_level": "high", "agent_mode": "wf-coder",
+     "step": "code", "step_path": "build-loop/iter-0/code", "...": "..."}
+  ],
+  "total": {
+    "credits_used": 15.8108, "agent_time": "9m 21s", "turns": 2, "sessions_counted": 2,
+    "by_model": {"claude-opus-5.5": {"credits_used": 15.8108, "turns": 2, "sessions": 2}}
+  }
+}
+```
+
+`workflow_id` finds every session whose `session.json` names that run under
+`_meta.kiro.workflow.workflowId`, including the workflow-creator step and steps
+that never send a message, and lists them oldest first (by `createdAt`, the
+order they ran in). The chat that launched the run is not included. Repeat-loop
+iterations share a `step` (`code` twice) and differ in `step_path`
+(`build-loop/iter-0/code`, `build-loop/iter-1/code`). An unknown run id returns
+an `error`.
+
+To pick sessions by hand, pass their ids as `session_ids` instead
+(`inspect_workflow` lists each step's `session: sess_...`). The output is the
+same:
 
 ```json
 {
@@ -69,7 +115,8 @@ them all as `session_ids`:
     {"session_id": "sess_85fe0f14-...", "credits_used": 0.9383, "agent_time": "11s", "...": "..."},
     {"session_id": "sess_nope", "error": "Session not found."}
   ],
-  "total": {"credits_used": 0.9383, "agent_time": "11s", "turns": 1, "sessions_counted": 1},
+  "total": {"credits_used": 0.9383, "agent_time": "11s", "turns": 1, "sessions_counted": 1,
+            "by_model": {"claude-opus-5.5": {"credits_used": 0.9383, "turns": 1, "sessions": 1}}},
   "note": "Not found, excluded from total: sess_nope."
 }
 ```
@@ -78,7 +125,9 @@ Each `sessions` entry is exactly what a single `session_id` call returns, in
 the order given; duplicate ids are dropped. `total` sums the raw on-disk
 credits and agent milliseconds, then rounds once (credits to 4 dp, agent time
 to whole seconds), so it can differ slightly from adding up the rounded rows.
-Unknown ids get an `error` entry and
+`by_model` splits the credits, turns and sessions in `total` by each session's
+`model`, in order of first appearance; a session with no recorded model counts
+under `unknown`. Unknown ids get an `error` entry and
 are left out of `total`. A session with a turn still running is counted with
 its completed turns only, and `note` names it. `session_time` is not totaled:
 it is time since each session was created, so step sessions overlap and keep
@@ -100,7 +149,9 @@ home:
 ~/.kiro/sessions/{workspace-key}/sess_{uuid}/messages.jsonl
 ```
 
-`session.json` carries `status`, `createdAt`, `modelId`, and `workspacePaths`.
+`session.json` carries `status`, `createdAt`, `modelId`, `effortLevel`,
+`agentMode`, and `workspacePaths`; a workflow step's also has
+`_meta.kiro.workflow` (`workflowId`, `nodeId`, `nodePath`).
 Credits arrive in `messages.jsonl` as a `usage_summary` record, appended when a
 turn completes:
 

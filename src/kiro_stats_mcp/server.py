@@ -9,13 +9,16 @@ import re
 
 from fastmcp import FastMCP
 
-from .readers import read_stats
+from .readers import read_stats, workflow_session_ids
 
 mcp = FastMCP(name="kiro-stats")
 
 # Separators accepted between ids in a session_ids string: commas, whitespace,
 # and the brackets/quotes of a JSON array passed as a string.
 _ID_SEPARATORS = re.compile(r"[\s,\[\]\"']+")
+
+# by_model key for sessions whose model is not recorded (pre-1.0).
+_UNKNOWN_MODEL = "unknown"
 
 
 def _fmt(ms: int | None) -> str | None:
@@ -52,6 +55,11 @@ def _format(data: dict) -> dict:
         "source": data["source"],
         "session_id": data["session_id"],
     }
+
+    # Recorded on 1.0+ only; left out when the session does not record them.
+    for key in ("model", "effort_level", "agent_mode", "step", "step_path"):
+        if data[key] is not None:
+            result[key] = data[key]
 
     # Per-turn figures exist only in 1.0+, where they match the number Kiro
     # shows in the chat footer for the last completed turn.
@@ -97,6 +105,8 @@ def _many_session_stats(layout: str, workspace_path: str | None,
     format once, so they can differ slightly from adding up the rounded rows.
     ``session_time`` is not totaled: each is time since that session was
     created, so step sessions overlap and keep growing after they finish.
+    ``by_model`` groups the total by each session's model (its current
+    ``session.json`` setting), in order of first appearance.
     """
     sessions = []
     credits = 0.0
@@ -104,6 +114,7 @@ def _many_session_stats(layout: str, workspace_path: str | None,
     turns = 0
     missing = []
     running = []
+    by_model = {}
 
     for sid in session_ids:
         data = read_stats(layout, workspace_path, sid)
@@ -115,6 +126,11 @@ def _many_session_stats(layout: str, workspace_path: str | None,
         credits += data["credits"]
         agent_ms += data["agent_ms"]
         turns += data["turns"]
+        group = by_model.setdefault(data["model"] or _UNKNOWN_MODEL,
+                                    {"credits": 0.0, "turns": 0, "sessions": 0})
+        group["credits"] += data["credits"]
+        group["turns"] += data["turns"]
+        group["sessions"] += 1
         if data["turn_in_flight"]:
             running.append(sid)
 
@@ -125,6 +141,11 @@ def _many_session_stats(layout: str, workspace_path: str | None,
             "agent_time": _fmt(agent_ms),
             "turns": turns,
             "sessions_counted": len(session_ids) - len(missing),
+            "by_model": {
+                model: {"credits_used": round(g["credits"], 4),
+                        "turns": g["turns"], "sessions": g["sessions"]}
+                for model, g in by_model.items()
+            },
         },
     }
 
@@ -143,13 +164,15 @@ def _many_session_stats(layout: str, workspace_path: str | None,
 
 
 @mcp.tool(description=(
-    "Get session credits and timing. For a workflow, after its steps finish, "
-    "pass the step session ids from inspect_workflow as session_ids for "
-    "per-step stats and a total."
+    "Get session credits, timing and model. For a workflow, after its steps "
+    "finish, pass its run id (wf_...) as workflow_id for per-step stats and a "
+    "total with credits by model; session_ids takes an explicit list of "
+    "session ids instead."
 ))
 def get_session_stats(layout: str = "auto", workspace_path: str | None = None,
                       session_id: str | None = None,
-                      session_ids: list[str] | str | None = None) -> dict:
+                      session_ids: list[str] | str | None = None,
+                      workflow_id: str | None = None) -> dict:
     """Return credits and timing for the active Kiro chat session.
 
     Args:
@@ -165,7 +188,25 @@ def get_session_stats(layout: str = "auto", workspace_path: str | None = None,
             per id, in order) and a ``total``. Use from the orchestrating chat
             once workflow steps have finished, since a turn's credits are
             written only when that turn ends.
+        workflow_id: Optional workflow run id (``wf_...``). Same output as
+            ``session_ids`` for every step session of that run, oldest first;
+            the chat that launched the run is not included. Kiro 1.0+ only.
+            Cannot be combined with ``session_id`` or ``session_ids``.
     """
+    if workflow_id is not None:
+        if session_id is not None or session_ids is not None:
+            return {"error": "Pass workflow_id alone, not with session_id or session_ids."}
+        workflow_id = workflow_id.strip()
+        if not workflow_id:
+            return {"error": "workflow_id is empty."}
+        try:
+            ids = workflow_session_ids(workflow_id, layout, workspace_path)
+            if not ids:
+                return {"error": f"No step sessions found for workflow {workflow_id}."}
+            return _many_session_stats(layout, workspace_path, ids)
+        except ValueError as exc:
+            return {"error": str(exc)}
+
     if session_ids is not None:
         if session_id is not None:
             return {"error": "Pass session_id or session_ids, not both."}

@@ -7,7 +7,7 @@
     1. Locates a usable Python 3.10+ interpreter
     2. Installs the kiro-stats-mcp package in editable mode
     3. Registers the MCP server in ~/.kiro/settings/mcp.json
-    4. Creates the /stats steering file for manual invocation
+    4. Copies the /stats steering file (.kiro/steering/stats.md) for manual invocation
 
     Run from the repo root:  .\install.ps1
 
@@ -185,16 +185,18 @@ if (-not (Test-Path $steeringDir)) {
     New-Item -ItemType Directory -Path $steeringDir -Force | Out-Null
 }
 
-$statsContent = @'
----
-inclusion: manual
----
-Call `get_session_stats` from the kiro-stats MCP server. Pass one of this session's workspace root paths as `workspace_path` so the right session is picked when several Kiro windows are open.
+# The repo's .kiro/steering/stats.md is the source; the installed copy is
+# regenerated from it on every install.
+$statsSource = Join-Path $repoRoot ".kiro\steering\stats.md"
+if (-not (Test-Path $statsSource)) {
+    Write-Host "ERROR: missing $statsSource" -ForegroundColor Red
+    exit 1
+}
+# Strip a BOM if an editor ever saved one into the repo copy: ahead of the
+# `---` it breaks front-matter parsing. Write-TextFile writes none.
+$statsContent = [System.IO.File]::ReadAllText($statsSource).TrimStart([char]0xFEFF)
 
-For a workflow, call it from the main chat after the workflow's steps finish: get the step session ids from one `inspect_workflow` call, then pass them all in one `get_session_stats` call as `session_ids` for per-step stats and a total. A turn's credits are written only when it ends, so steps should not call it themselves mid-turn.
-'@
-
-Write-TextFile (Join-Path $steeringDir "stats.md") ($statsContent + "`n")
+Write-TextFile (Join-Path $steeringDir "stats.md") $statsContent
 Write-Host "  OK - Created stats.md in $steeringDir" -ForegroundColor Green
 
 # --- Cleanup old files if present ---
