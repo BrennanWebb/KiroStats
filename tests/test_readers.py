@@ -590,6 +590,105 @@ def test_tool_rejects_bad_layout(v1_root):
     assert "unknown layout" in get_session_stats(layout="nope")["error"]
 
 
+def _write_workflow_steps(v1_root):
+    path = r"c:\repos\KiroStats"
+    _write_v1_session(v1_root, "ws01", "sess_one", status="idle",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(1.0234, 14_915)], workspace_paths=[path],
+                      agent_mode="wf-workflow-creator", markers=True)
+    _write_v1_session(v1_root, "ws01", "sess_two", status="idle",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(0.9383, 11_680), (0.5, 95_366)],
+                      workspace_paths=[path], agent_mode="wf-coder", markers=True)
+
+
+def test_tool_session_ids_array(v1_root):
+    _write_workflow_steps(v1_root)
+
+    got = get_session_stats(session_ids=["sess_two", "sess_one"])
+    assert [s["session_id"] for s in got["sessions"]] == ["sess_two", "sess_one"]
+    two, one = got["sessions"]
+    # Each entry matches the single-id output exactly.
+    assert two == get_session_stats(session_id="sess_two")
+    assert one == get_session_stats(session_id="sess_one")
+    assert got["total"] == {
+        "credits_used": 2.4617,
+        "agent_time": "2m 1s",
+        "turns": 3,
+        "sessions_counted": 2,
+    }
+    assert "note" not in got
+
+
+@pytest.mark.parametrize("value", [
+    "sess_one, sess_two",
+    "sess_one,sess_two",
+    "sess_one sess_two",
+    '["sess_one", "sess_two"]',
+    "sess_one, sess_two, sess_one",
+    ["sess_one, sess_two"],
+])
+def test_tool_session_ids_string(v1_root, value):
+    _write_workflow_steps(v1_root)
+
+    got = get_session_stats(session_ids=value)
+    assert [s["session_id"] for s in got["sessions"]] == ["sess_one", "sess_two"]
+    assert got["total"]["credits_used"] == 2.4617
+    assert got["total"]["sessions_counted"] == 2
+
+
+def test_tool_session_ids_unknown_id_excluded_from_total(v1_root):
+    _write_workflow_steps(v1_root)
+
+    got = get_session_stats(session_ids="sess_one, sess_nope")
+    assert got["sessions"][1] == {"session_id": "sess_nope", "error": "Session not found."}
+    assert got["total"]["credits_used"] == 1.0234
+    assert got["total"]["sessions_counted"] == 1
+    assert "Not found, excluded from total: sess_nope." in got["note"]
+
+
+def test_tool_session_ids_flags_running_turn(v1_root, monkeypatch):
+    _write_workflow_steps(v1_root)
+    _write_v1_session(v1_root, "ws01", "sess_run", status="in_progress",
+                      created="2026-08-31T20:00:00.000Z",
+                      turns=[(0.25, 1_000)], markers=True,
+                      open_turn_at="2026-08-31T20:05:00.000Z")
+    monkeypatch.setattr(readers, "_now_ms", lambda: T0_MS + 300_000 + 42_000)
+
+    got = get_session_stats(session_ids=["sess_one", "sess_run"])
+    run = got["sessions"][1]
+    assert run["current_turn_time"] == "42s"
+    assert "Current turn still running" in run["note"]
+    # Completed turns are counted; the open turn is not.
+    assert got["total"]["credits_used"] == 1.2734
+    assert got["total"]["agent_time"] == "15s"
+    assert "Turn still running in sess_run" in got["note"]
+
+
+def test_tool_session_ids_total_sums_raw_values(v1_root):
+    for sid in ("sess_a", "sess_b"):
+        _write_v1_session(v1_root, "ws01", sid, status="idle",
+                          created="2026-08-31T20:00:00.000Z",
+                          turns=[(1.00004, 1_600)])
+
+    got = get_session_stats(session_ids=["sess_a", "sess_b"])
+    assert [s["credits_used"] for s in got["sessions"]] == [1.0, 1.0]
+    assert [s["agent_time"] for s in got["sessions"]] == ["1s", "1s"]
+    assert got["total"]["credits_used"] == 2.0001
+    assert got["total"]["agent_time"] == "3s"
+
+
+def test_tool_session_ids_rejects_bad_input(v1_root):
+    _write_workflow_steps(v1_root)
+
+    assert "not both" in get_session_stats(
+        session_id="sess_one", session_ids=["sess_two"])["error"]
+    assert "no session ids" in get_session_stats(session_ids=" , ")["error"]
+    assert "no session ids" in get_session_stats(session_ids=[])["error"]
+    assert "unknown layout" in get_session_stats(
+        layout="nope", session_ids=["sess_one"])["error"]
+
+
 @pytest.mark.parametrize("ms,expected", [
     (0, "0s"), (999, "0s"), (1000, "1s"), (59_000, "59s"),
     (60_000, "1m 0s"), (387_160, "6m 27s"), (3_599_000, "59m 59s"),

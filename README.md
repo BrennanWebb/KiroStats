@@ -41,18 +41,47 @@ respond.
 
 ## Tool
 
-`get_session_stats(layout="auto", workspace_path=None, session_id=None)`
+`get_session_stats(layout="auto", workspace_path=None, session_id=None, session_ids=None)`
 
 | Arg | Purpose |
 |-----|---------|
 | `layout` | `auto` prefers 1.0+ and falls back to pre-1.0. Force with `v1` or `legacy`. |
 | `workspace_path` | A workspace root path. Narrows the search to that workspace. 1.0+ only. |
 | `session_id` | An exact session id, e.g. from an earlier response or the ambiguity note. |
+| `session_ids` | Several exact session ids, as a list or one string (`"id1, id2, id3"`). Cannot be combined with `session_id`. |
 
 Returns `credits_used` (session total), `agent_time` (completed turns),
 `session_time`, `turns`, `source`, and `session_id`, plus `last_turn_credits` /
 `last_turn_time` on 1.0+. `current_turn_time` appears while a turn is running.
 A `note` field appears when a caveat applies.
+
+### Workflows
+
+Each workflow step runs as its own session, and a turn's credits are written
+only when that turn ends. Gather stats from the orchestrating chat after the
+steps finish: `inspect_workflow` lists every step's `session: sess_...`,
+including the workflow-creator step and steps that never send a message. Pass
+them all as `session_ids`:
+
+```json
+{
+  "sessions": [
+    {"session_id": "sess_85fe0f14-...", "credits_used": 0.9383, "agent_time": "11s", "...": "..."},
+    {"session_id": "sess_nope", "error": "Session not found."}
+  ],
+  "total": {"credits_used": 0.9383, "agent_time": "11s", "turns": 1, "sessions_counted": 1},
+  "note": "Not found, excluded from total: sess_nope."
+}
+```
+
+Each `sessions` entry is exactly what a single `session_id` call returns, in
+the order given; duplicate ids are dropped. `total` sums the raw credits and
+milliseconds, so it can differ from adding the rounded per-session figures by
+0.0001 credits or a second per session. Unknown ids get an `error` entry and
+are left out of `total`. A session with a turn still running is counted with
+its completed turns only, and `note` names it. `session_time` is not totaled:
+it is time since each session was created, so step sessions overlap and keep
+growing after they finish.
 
 ## How It Works
 
@@ -90,7 +119,11 @@ That record is what the chat footer renders: `18.5044` and `387160 ms` display a
 
 Each turn is bracketed by `turn_start` and `turn_end` records. KiroStats counts
 `turns` by `turn_end` (so aborted, unmetered turns still count) and uses an open
-`turn_start` to report `current_turn_time` for the turn in progress.
+`turn_start` to report `current_turn_time` for the turn in progress. Workflow
+step sessions sometimes log an extra `turn_end` with `stopReason: "cancelled"`
+a few seconds into a turn that then carries on under the same `executionId`,
+so such a step reports one more turn than it ran. Credits and time are
+unaffected.
 
 Workflow steps (`agentMode` such as `wf-planner`) run as their own sessions and
 share the parent chat's `workspacePaths`.

@@ -1,6 +1,6 @@
 [project]
 name = "kiro-stats-mcp"
-version = "3.0.0"
+version = "2.4.0"
 description = "Local MCP server that exposes Kiro IDE credit usage and session timing to agents"
 readme = "README.md"
 requires-python = ">=3.10"
