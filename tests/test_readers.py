@@ -665,7 +665,7 @@ def test_tool_session_ids_flags_running_turn(v1_root, monkeypatch):
     assert "Turn still running in sess_run" in got["note"]
 
 
-def test_tool_session_ids_total_sums_raw_values(v1_root):
+def test_tool_session_ids_total_sums_displayed_values(v1_root):
     for sid in ("sess_a", "sess_b"):
         _write_v1_session(v1_root, "ws01", sid, status="idle",
                           created="2026-08-31T20:00:00.000Z",
@@ -674,8 +674,8 @@ def test_tool_session_ids_total_sums_raw_values(v1_root):
     got = get_session_stats(session_ids=["sess_a", "sess_b"])
     assert [s["credits_used"] for s in got["sessions"]] == [1.0, 1.0]
     assert [s["agent_time"] for s in got["sessions"]] == ["1s", "1s"]
-    assert got["total"]["credits_used"] == 2.0001
-    assert got["total"]["agent_time"] == "3s"
+    assert got["total"]["credits_used"] == 2.0
+    assert got["total"]["agent_time"] == "2s"
 
 
 def test_tool_session_ids_rejects_bad_input(v1_root):

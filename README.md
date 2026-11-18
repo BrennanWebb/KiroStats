@@ -75,9 +75,9 @@ them all as `session_ids`:
 ```
 
 Each `sessions` entry is exactly what a single `session_id` call returns, in
-the order given; duplicate ids are dropped. `total` sums the raw credits and
-milliseconds, so it can differ from adding the rounded per-session figures by
-0.0001 credits or a second per session. Unknown ids get an `error` entry and
+the order given; duplicate ids are dropped. `total` sums the per-session figures
+as shown (credits to 4 dp, agent time in whole seconds), so it equals adding
+up the rows. Unknown ids get an `error` entry and
 are left out of `total`. A session with a turn still running is counted with
 its completed turns only, and `note` names it. `session_time` is not totaled:
 it is time since each session was created, so step sessions overlap and keep
