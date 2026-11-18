@@ -690,8 +690,9 @@ def _write_workflow_steps(v1_root):
                       workspace_paths=[path], agent_mode="wf-coder", markers=True)
 
 
-def test_tool_session_ids_array(v1_root):
+def test_tool_session_ids_array(v1_root, monkeypatch):
     _write_workflow_steps(v1_root)
+    monkeypatch.setattr(readers, "_now_ms", lambda: T0_MS + 600_000)
 
     got = get_session_stats(session_ids=["sess_two", "sess_one"])
     assert [s["session_id"] for s in got["sessions"]] == ["sess_two", "sess_one"]
@@ -983,8 +984,10 @@ def test_v1_workflow_session_ids_in_run_order(v1_root):
         readers.workflow_session_ids(WF, "nope")
 
 
-def test_tool_workflow_id_matches_session_ids(v1_root):
+def test_tool_workflow_id_matches_session_ids(v1_root, monkeypatch):
     expected = _write_workflow_run(v1_root)
+    # Freeze the clock so session_time is equal across the two calls.
+    monkeypatch.setattr(readers, "_now_ms", lambda: T0_MS + 600_000)
 
     got = get_session_stats(workspace_path=REPO, workflow_id=WF)
     assert [s["session_id"] for s in got["sessions"]] == expected
